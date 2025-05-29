@@ -290,8 +290,9 @@ class MelDecoder(nn.Module):
         batch_size = encoder_output.shape[0]
         device = encoder_output.device
         
-        if self.training and mel_target is not None:
-            # 训练模式：使用teacher forcing
+        # 修复逻辑：如果提供了mel_target，就使用teacher forcing，无论训练还是验证模式
+        if mel_target is not None:
+            # Teacher forcing模式：使用目标mel序列
             tgt_len = mel_target.shape[1]
             
             # 将mel频谱图投影到d_model维度
@@ -320,7 +321,7 @@ class MelDecoder(nn.Module):
             return mel_outputs, stop_outputs, all_attention_weights
             
         else:
-            # 推理模式：自回归生成
+            # 推理模式：自回归生成（只有在没有提供mel_target时才使用）
             if max_len is None:
                 max_len = self.max_len
                 

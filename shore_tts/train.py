@@ -118,7 +118,7 @@ def create_dataloader(config, rank, world_size, is_validation=False):
     # 计算划分索引
     val_split = training_config.get('val_split', 0.1)
     total_size = len(full_dataset)
-    val_size = 500
+    val_size = int(total_size * val_split)
     train_size = total_size - val_size
     
     # 设置随机种子确保划分一致性
@@ -218,25 +218,6 @@ def create_optimizer(model, config):
             alpha=0.9,
             momentum=0.9
         )
-    
-    elif training_config['optimizer'] == 'AdamW_8bit':
-        # 8bit AdamW，大幅减少内存占用
-        try:
-            import bitsandbytes as bnb
-            optimizer = bnb.optim.AdamW8bit(
-                model.parameters(),
-                lr=training_config['learning_rate'],
-                weight_decay=1e-6
-            )
-        except ImportError:
-            print("AdamW_8bit需要安装bitsandbytes库: pip install bitsandbytes")
-            # 回退到RMSprop
-            optimizer = optim.RMSprop(
-                model.parameters(),
-                lr=training_config['learning_rate'],
-                weight_decay=1e-6,
-                alpha=0.9
-            )
         
     else:
         raise ValueError(f"不支持的优化器: {training_config['optimizer']}")
@@ -646,7 +627,7 @@ def train_process(config, args):
                     patience_counter = 0
                     
                     if rank == 0:
-                        best_model_path = os.path.join(save_dir, "best_model.pt")
+                        best_model_path = os.path.join(save_dir, "best_model.pth")
                         save_checkpoint(
                             model, optimizer, scheduler, epoch,
                             epoch * len(train_dataloader), val_loss, best_model_path, rank
