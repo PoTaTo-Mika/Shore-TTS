@@ -4,7 +4,7 @@
     "vocab_size": 223,
     "text_embedding_dim": 128,
     "text_hidden_dim": 128,
-    "text_n_layers": 4,
+    "text_n_layers": 3,
     "text_n_heads": 8,
     "text_d_model": 128,
     "n_mels": 128,
@@ -14,10 +14,10 @@
     "decoder_d_ff": 512,
     "postnet_n_layers": 5,
     "postnet_kernel_size": 5,
-    "postnet_n_channels": 512,
+    "postnet_n_channels": 256,
     "dropout": 0.1,
-    "max_text_len": 1024,
-    "max_mel_len": 2048
+    "max_text_len": 512,
+    "max_mel_len": 3000
     },
     "training":
     {
@@ -27,17 +27,22 @@
         "gradient_accumulation_steps": 4,
         "seed": 42,
         "save_dir": "checkpoints/tts",
-        "optimizer": "AdamW",
+        "optimizer": "AdaFactor",
+        "val_interval": 1,
+        "val_split": 0.1,
+        "save_best_model": true,
+        "early_stopping_patience": 10,
         "distributed":{
             "enabled": true,
-            "world_size": 1, 
+            "world_size": 8, 
             "rank": 0,
             "dist_backend": "nccl",
             "dist_url": "tcp://localhost:12345"
         },
         "data":{
             "mel_list_path": "data/mel_list.list",
-            "pinyin_list_path": "data/pinyin_list.list"
+            "pinyin_list_path": "data/pinyin_list.list",
+            "enable_filter": false
         }
     }
 }

@@ -17,11 +17,13 @@ class ShoreDataset(data.Dataset):
                  pinyin_list_path,
                  device = 'cuda',
                  max_mel_length = 3000, # 主要是mel容易爆显存
-                 min_mel_length = 100 # 最小mel长度
+                 min_mel_length = 100, # 最小mel长度
+                 enable_filter = True  # 是否启用数据过滤，False时跳过过滤以加快启动速度
     ):
         self.device = device
         self.max_mel_length = max_mel_length
         self.min_mel_length = min_mel_length
+        self.enable_filter = enable_filter
         
         with open(mel_list_path, 'r', encoding='utf-8') as f:
             # mel_list = ['mel/1.pt', 'mel/2.pt', 'mel/3.pt']
@@ -33,11 +35,17 @@ class ShoreDataset(data.Dataset):
         print(f"原始mel总数量: {len(self.mel_list)}")
         print(f"原始文本总数量: {len(self.pinyin_list)}")
         
-        # 检查数据一致性并过滤异常数据
-        self._filter_bad_data()
-        
-        print(f"过滤后mel总数量: {len(self.mel_list)}")
-        print(f"过滤后文本总数量: {len(self.pinyin_list)}")
+        if self.enable_filter:
+            # 检查数据一致性并过滤异常数据
+            self._filter_bad_data()
+            print(f"过滤后mel总数量: {len(self.mel_list)}")
+            print(f"过滤后文本总数量: {len(self.pinyin_list)}")
+        else:
+            # 不进行详细过滤，但仍需确保基本的长度一致性
+            print("跳过数据过滤步骤（enable_filter=False）")
+            self._ensure_length_consistency()
+            print(f"长度对齐后mel总数量: {len(self.mel_list)}")
+            print(f"长度对齐后文本总数量: {len(self.pinyin_list)}")
 
     def __len__(self):
         return len(self.mel_list)
@@ -107,6 +115,19 @@ class ShoreDataset(data.Dataset):
             return False, mel, phoneme
         
         return True, mel, phoneme
+    
+    def _ensure_length_consistency(self):
+        """
+        确保mel和pinyin列表长度一致，避免索引越界
+        这是一个轻量级的检查，用于enable_filter=False时
+        """
+        if len(self.mel_list) != len(self.pinyin_list):
+            print(f"警告: mel列表长度({len(self.mel_list)}) != pinyin列表长度({len(self.pinyin_list)})")
+            # 取较短的长度，避免索引越界
+            min_length = min(len(self.mel_list), len(self.pinyin_list))
+            self.mel_list = self.mel_list[:min_length]
+            self.pinyin_list = self.pinyin_list[:min_length]
+            print(f"已截断到相同长度: {min_length}")
     
     def _filter_bad_data(self):
         """
@@ -251,16 +272,38 @@ if __name__ == "__main__":
     # 创建测试数据集
     # By Claude-4-sonnet
     try:
-        # 测试不同的参数设置
-        print("=== 创建数据集并测试过滤功能 ===")
-        dataset = ShoreDataset("data/mel_list.list", "data/pinyin_list.list", 
-                              max_mel_length=3000, min_mel_length=100)
+        # 测试启用过滤的情况
+        print("=== 测试启用过滤 (enable_filter=True) ===")
+        dataset_with_filter = ShoreDataset("data/mel_list.list", "data/pinyin_list.list", 
+                              max_mel_length=3000, min_mel_length=100, enable_filter=True)
+        print(f"启用过滤的数据集长度: {len(dataset_with_filter)}")
+        
+        # 测试禁用过滤的情况  
+        print(f"\n{'='*60}")
+        print("=== 测试禁用过滤 (enable_filter=False) ===")
+        dataset_without_filter = ShoreDataset("data/mel_list.list", "data/pinyin_list.list", 
+                              max_mel_length=3000, min_mel_length=100, enable_filter=False)
+        print(f"禁用过滤的数据集长度: {len(dataset_without_filter)}")
+        
+        # 对比两种情况的数据量差异
+        print(f"\n=== 过滤效果对比 ===")
+        print(f"启用过滤后的数据量: {len(dataset_with_filter)}")
+        print(f"禁用过滤后的数据量: {len(dataset_without_filter)}")
+        filtered_out = len(dataset_without_filter) - len(dataset_with_filter)
+        filter_ratio = filtered_out / len(dataset_without_filter) * 100 if len(dataset_without_filter) > 0 else 0
+        print(f"被过滤掉的数据量: {filtered_out}")
+        print(f"过滤比例: {filter_ratio:.2f}%")
+        
+        # 使用禁用过滤的数据集进行后续测试（更快）
+        dataset = dataset_without_filter
+        print(f"\n=== 使用禁用过滤的数据集进行后续测试 ===")
         print(f"数据集总长度: {len(dataset)}")
         
         # 测试过滤功能是否正常工作
-        print(f"\n=== 测试数据过滤效果 ===")
+        print(f"\n=== 测试数据参数设置 ===")
         print(f"最大mel长度限制: {dataset.max_mel_length}")
         print(f"最小mel长度限制: {dataset.min_mel_length}")
+        print(f"是否启用数据过滤: {dataset.enable_filter}")
         
         # 测试前几个样本的原始数据
         print("\n=== 测试前3个样本的原始数据 ===")
@@ -292,8 +335,15 @@ if __name__ == "__main__":
                 ratio = mel_length / len(phoneme_ids) if len(phoneme_ids) > 0 else 0
                 print(f"  mel/phoneme比例: {ratio:.2f}")
                 
+                # 如果禁用了过滤，提醒用户可能存在的问题
+                if not dataset.enable_filter:
+                    if mel_length > dataset.max_mel_length or mel_length < dataset.min_mel_length:
+                        print(f"  ⚠️  警告: 由于禁用了过滤，该样本mel长度超出范围!")
+                
             except Exception as e:
                 print(f"处理样本 {i} 时出错: {e}")
+                if not dataset.enable_filter:
+                    print(f"  ⚠️  这可能是由于禁用了数据过滤导致的异常数据")
                 import traceback
                 traceback.print_exc()
         

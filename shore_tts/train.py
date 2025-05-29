@@ -8,13 +8,17 @@ import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from tqdm import tqdm
 import time
 import argparse
+import warnings
+
+# 过滤CUDNN相关警告
+warnings.filterwarnings('ignore', category=UserWarning, message='.*cudnn.*')
+warnings.filterwarnings('ignore', category=UserWarning, message='.*CUDNN.*')
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)  # 获取项目根目录
@@ -52,24 +56,25 @@ def set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
 
-def setup_distributed(rank, world_size, dist_url, dist_backend):
-    """设置分布式训练环境"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = dist_url.split(':')[-1]
+def setup_distributed():
+    """设置分布式训练环境，用于torchrun启动"""
+    # 从环境变量获取分布式训练参数
+    rank = int(os.environ.get('RANK', 0))
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
     
     # 初始化进程组
-    dist.init_process_group(
-        backend=dist_backend,
-        rank=rank,
-        world_size=world_size
-    )
+    if world_size > 1:
+        dist.init_process_group(backend='nccl')
+        # 设置当前进程使用的GPU
+        torch.cuda.set_device(local_rank)
     
-    # 设置当前进程使用的GPU
-    torch.cuda.set_device(rank)
+    return rank, local_rank, world_size
 
 def cleanup_distributed():
     """清理分布式训练环境"""
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def create_model(config):
     """创建模型"""
@@ -95,22 +100,40 @@ def create_model(config):
     )
     return model
 
-def create_dataloader(config, rank, world_size):
+def create_dataloader(config, rank, world_size, is_validation=False):
     """创建数据加载器"""
     data_config = config['training']['data']
     training_config = config['training']
     
-    # 创建数据集
-    dataset = ShoreDataset(
+    # 创建完整数据集
+    full_dataset = ShoreDataset(
         mel_list_path=data_config['mel_list_path'],
         pinyin_list_path=data_config['pinyin_list_path'],
-        device=f'cuda:{rank}',
+        device='cpu',  # 修改为CPU，避免多进程CUDA问题
         max_mel_length=config['model']['max_mel_len'],
-        min_mel_length=100
+        min_mel_length=100,
+        enable_filter=data_config['enable_filter']
     )
     
+    # 计算划分索引
+    val_split = training_config.get('val_split', 0.1)
+    total_size = len(full_dataset)
+    val_size = 500
+    train_size = total_size - val_size
+    
+    # 设置随机种子确保划分一致性
+    torch.manual_seed(config['training']['seed'])
+    
+    # 划分数据集
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size]
+    )
+    
+    # 选择要使用的数据集
+    dataset = val_dataset if is_validation else train_dataset
+    
     # 创建分布式采样器
-    if config['training']['distributed']['enabled'] and world_size > 1:
+    if world_size > 1 and not is_validation:
         sampler = DistributedSampler(
             dataset,
             num_replicas=world_size,
@@ -125,8 +148,8 @@ def create_dataloader(config, rank, world_size):
         dataset,
         batch_size=training_config['batch_size'],
         sampler=sampler,
-        shuffle=(sampler is None),
-        collate_fn=dataset.collate_fn,
+        shuffle=(sampler is None and not is_validation),
+        collate_fn=full_dataset.collate_fn,
         num_workers=4,
         pin_memory=True,
         drop_last=True
@@ -149,6 +172,83 @@ def create_optimizer(model, config):
             model.parameters(),
             lr=training_config['learning_rate']
         )
+
+    elif training_config['optimizer'] == 'SGD':
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=training_config['learning_rate'],
+            weight_decay=1e-6
+        )
+    
+    elif training_config['optimizer'] == 'AdaFactor':
+        # AdaFactor: 内存高效的Adam替代方案
+        try:
+            from transformers import Adafactor
+            optimizer = Adafactor(
+                model.parameters(),
+                lr=training_config['learning_rate'],
+                scale_parameter=False,
+                relative_step=False,
+                warmup_init=False,
+                weight_decay=1e-6
+            )
+        except ImportError:
+            print("AdaFactor需要安装transformers库: pip install transformers")
+            # 回退到RMSprop
+            optimizer = optim.RMSprop(
+                model.parameters(),
+                lr=training_config['learning_rate'],
+                weight_decay=1e-6,
+                alpha=0.9
+            )
+    
+    elif training_config['optimizer'] == 'Lion':
+        # Lion: Google开发的内存高效优化器
+        try:
+            from lion_pytorch import Lion
+            optimizer = Lion(
+                model.parameters(),
+                lr=training_config['learning_rate'] * 0.1,  # Lion通常需要更小的学习率
+                weight_decay=1e-2  # Lion通常需要更大的weight_decay
+            )
+        except ImportError:
+            print("Lion需要安装lion-pytorch库: pip install lion-pytorch")
+            # 回退到RMSprop
+            optimizer = optim.RMSprop(
+                model.parameters(),
+                lr=training_config['learning_rate'],
+                weight_decay=1e-6,
+                alpha=0.9
+            )
+    
+    elif training_config['optimizer'] == 'RMSprop':
+        optimizer = optim.RMSprop(
+            model.parameters(),
+            lr=training_config['learning_rate'],
+            weight_decay=1e-6,
+            alpha=0.9,
+            momentum=0.9
+        )
+    
+    elif training_config['optimizer'] == 'AdamW_8bit':
+        # 8bit AdamW，大幅减少内存占用
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                model.parameters(),
+                lr=training_config['learning_rate'],
+                weight_decay=1e-6
+            )
+        except ImportError:
+            print("AdamW_8bit需要安装bitsandbytes库: pip install bitsandbytes")
+            # 回退到RMSprop
+            optimizer = optim.RMSprop(
+                model.parameters(),
+                lr=training_config['learning_rate'],
+                weight_decay=1e-6,
+                alpha=0.9
+            )
+        
     else:
         raise ValueError(f"不支持的优化器: {training_config['optimizer']}")
     
@@ -274,6 +374,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, epoch, confi
     for step, batch_data in enumerate(pbar):
         padded_mels, padded_phoneme_ids, mel_lengths, phoneme_lengths = batch_data
         
+        # 将数据移动到GPU
+        device = next(model.parameters()).device
+        padded_mels = padded_mels.to(device)
+        padded_phoneme_ids = padded_phoneme_ids.to(device)
+        mel_lengths = mel_lengths.to(device)
+        phoneme_lengths = phoneme_lengths.to(device)
+        
         # 转换mel格式: [batch, n_mels, max_len] -> [batch, max_len, n_mels]
         mel_targets = padded_mels.transpose(1, 2)
         
@@ -334,37 +441,99 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, epoch, confi
     
     return avg_loss, avg_mel_loss, avg_postnet_loss, avg_stop_loss
 
-def train_process(rank, world_size, config, args):
-    """分布式训练进程"""
+def validate_epoch(model, dataloader, config, rank):
+    """验证一个epoch"""
+    model.eval()
+    total_loss = 0
+    total_mel_loss = 0
+    total_postnet_loss = 0
+    total_stop_loss = 0
+    
+    # 只在主进程显示进度条
+    if rank == 0:
+        pbar = tqdm(dataloader, desc='Validation')
+    else:
+        pbar = dataloader
+    
+    with torch.no_grad():
+        for step, batch_data in enumerate(pbar):
+            padded_mels, padded_phoneme_ids, mel_lengths, phoneme_lengths = batch_data
+            
+            # 将数据移动到GPU
+            device = next(model.parameters()).device
+            padded_mels = padded_mels.to(device)
+            padded_phoneme_ids = padded_phoneme_ids.to(device)
+            mel_lengths = mel_lengths.to(device)
+            phoneme_lengths = phoneme_lengths.to(device)
+            
+            # 转换mel格式: [batch, n_mels, max_len] -> [batch, max_len, n_mels]
+            mel_targets = padded_mels.transpose(1, 2)
+            
+            # 前向传播
+            mel_outputs, mel_outputs_postnet, stop_outputs, attention_weights = model(
+                phoneme_ids=padded_phoneme_ids,
+                phoneme_lengths=phoneme_lengths,
+                mel_target=mel_targets
+            )
+            
+            # 计算损失
+            loss, mel_loss, postnet_loss, stop_loss = compute_loss(
+                mel_outputs, mel_outputs_postnet, stop_outputs, mel_targets, mel_lengths
+            )
+            
+            # 统计损失
+            total_loss += loss.item()
+            total_mel_loss += mel_loss.item()
+            total_postnet_loss += postnet_loss.item()
+            total_stop_loss += stop_loss.item()
+            
+            # 更新进度条
+            if rank == 0:
+                pbar.set_postfix({
+                    'Val Loss': f'{loss.item():.4f}',
+                    'Mel': f'{mel_loss.item():.4f}',
+                    'Post': f'{postnet_loss.item():.4f}',
+                    'Stop': f'{stop_loss.item():.4f}'
+                })
+    
+    # 计算平均损失
+    num_batches = len(dataloader)
+    avg_loss = total_loss / num_batches
+    avg_mel_loss = total_mel_loss / num_batches
+    avg_postnet_loss = total_postnet_loss / num_batches
+    avg_stop_loss = total_stop_loss / num_batches
+    
+    return avg_loss, avg_mel_loss, avg_postnet_loss, avg_stop_loss
+
+def train_process(config, args):
+    """训练进程"""
     try:
+        # 设置分布式环境
+        rank, local_rank, world_size = setup_distributed()
+        
         # 设置日志
         setup_logging(rank)
         
         # 设置随机种子
         set_random_seed(config['training']['seed'])
         
-        # 设置分布式环境
-        if config['training']['distributed']['enabled'] and world_size > 1:
-            setup_distributed(
-                rank, 
-                world_size, 
-                config['training']['distributed']['dist_url'],
-                config['training']['distributed']['dist_backend']
-            )
-        
         # 设置设备
-        device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() and world_size > 1 else 'cuda' if torch.cuda.is_available() else 'cpu')
         
         if rank == 0:
             logging.info(f"开始训练，使用设备: {device}")
+            logging.info(f"分布式训练: 世界大小={world_size}, 当前进程rank={rank}, 本地rank={local_rank}")
             logging.info(f"配置: {json.dumps(config, indent=2, ensure_ascii=False)}")
         
         # 创建数据加载器
-        dataloader, sampler = create_dataloader(config, rank, world_size)
+        train_dataloader, train_sampler = create_dataloader(config, rank, world_size, is_validation=False)
+        val_dataloader, _ = create_dataloader(config, rank, world_size, is_validation=True)
         
         if rank == 0:
-            logging.info(f"数据集大小: {len(dataloader.dataset)}")
-            logging.info(f"批次数量: {len(dataloader)}")
+            logging.info(f"训练集大小: {len(train_dataloader.dataset)}")
+            logging.info(f"验证集大小: {len(val_dataloader.dataset)}")
+            logging.info(f"训练批次数量: {len(train_dataloader)}")
+            logging.info(f"验证批次数量: {len(val_dataloader)}")
         
         # 创建模型
         model = create_model(config)
@@ -377,14 +546,14 @@ def train_process(rank, world_size, config, args):
             logging.info(f"模型参数数量: {total_params:,} (可训练: {trainable_params:,})")
         
         # 创建分布式模型
-        if config['training']['distributed']['enabled'] and world_size > 1:
-            model = DDP(model, device_ids=[rank])
+        if world_size > 1:
+            model = DDP(model, device_ids=[local_rank])
         
         # 创建优化器
         optimizer = create_optimizer(model, config)
         
         # 创建学习率调度器
-        total_steps = len(dataloader) * config['training']['epochs']
+        total_steps = len(train_dataloader) * config['training']['epochs']
         scheduler = create_scheduler(optimizer, config, total_steps)
         
         # 加载检查点（如果存在）
@@ -400,16 +569,23 @@ def train_process(rank, world_size, config, args):
         if rank == 0:
             os.makedirs(save_dir, exist_ok=True)
         
+        # 初始化早停变量
+        best_val_loss = float('inf')
+        patience_counter = 0
+        early_stopping_patience = config['training'].get('early_stopping_patience', 10)
+        val_interval = config['training'].get('val_interval', 5)
+        save_best_model = config['training'].get('save_best_model', True)
+        
         # 训练循环
         for epoch in range(start_epoch, config['training']['epochs']):
             # 设置分布式采样器的epoch（用于打乱数据）
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             
             # 训练一个epoch
             start_time = time.time()
             avg_loss, avg_mel_loss, avg_postnet_loss, avg_stop_loss = train_epoch(
-                model, dataloader, optimizer, scheduler, None, epoch, config, rank
+                model, train_dataloader, optimizer, scheduler, None, epoch, config, rank
             )
             epoch_time = time.time() - start_time
             
@@ -417,19 +593,58 @@ def train_process(rank, world_size, config, args):
             if rank == 0:
                 logging.info(
                     f"Epoch {epoch}/{config['training']['epochs']} - "
-                    f"Loss: {avg_loss:.4f}, "
+                    f"Train Loss: {avg_loss:.4f}, "
                     f"Mel: {avg_mel_loss:.4f}, "
                     f"Post: {avg_postnet_loss:.4f}, "
                     f"Stop: {avg_stop_loss:.4f}, "
                     f"Time: {epoch_time:.2f}s"
                 )
             
-            # 保存检查点
-            if rank == 0 and (epoch + 1) % 5 == 0:
+            # 验证
+            if (epoch + 1) % val_interval == 0:
+                val_start_time = time.time()
+                val_loss, val_mel_loss, val_postnet_loss, val_stop_loss = validate_epoch(
+                    model, val_dataloader, config, rank
+                )
+                val_time = time.time() - val_start_time
+                
+                if rank == 0:
+                    logging.info(
+                        f"Validation - "
+                        f"Loss: {val_loss:.4f}, "
+                        f"Mel: {val_mel_loss:.4f}, "
+                        f"Post: {val_postnet_loss:.4f}, "
+                        f"Stop: {val_stop_loss:.4f}, "
+                        f"Time: {val_time:.2f}s"
+                    )
+                
+                # 保存最佳模型
+                if save_best_model and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    
+                    if rank == 0:
+                        best_model_path = os.path.join(save_dir, "best_model.pt")
+                        save_checkpoint(
+                            model, optimizer, scheduler, epoch,
+                            epoch * len(train_dataloader), val_loss, best_model_path, rank
+                        )
+                        logging.info(f"保存最佳模型，验证损失: {val_loss:.4f}")
+                else:
+                    patience_counter += 1
+                
+                # 早停检查
+                if patience_counter >= early_stopping_patience:
+                    if rank == 0:
+                        logging.info(f"早停触发，验证损失连续{early_stopping_patience}次验证没有改善")
+                    break
+            
+            # 保存定期检查点
+            if rank == 0 and (epoch + 1) % 1 == 0:
                 checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt")
                 save_checkpoint(
                     model, optimizer, scheduler, epoch, 
-                    epoch * len(dataloader), avg_loss, checkpoint_path, rank
+                    epoch * len(train_dataloader), avg_loss, checkpoint_path, rank
                 )
         
         # 保存最终模型
@@ -437,7 +652,7 @@ def train_process(rank, world_size, config, args):
             final_checkpoint_path = os.path.join(save_dir, "final_model.pt")
             save_checkpoint(
                 model, optimizer, scheduler, config['training']['epochs'] - 1,
-                config['training']['epochs'] * len(dataloader), avg_loss, 
+                config['training']['epochs'] * len(train_dataloader), avg_loss, 
                 final_checkpoint_path, rank
             )
             logging.info("训练完成！")
@@ -449,8 +664,7 @@ def train_process(rank, world_size, config, args):
     
     finally:
         # 清理分布式环境
-        if config['training']['distributed']['enabled'] and world_size > 1:
-            cleanup_distributed()
+        cleanup_distributed()
 
 def main():
     # 解析命令行参数
@@ -464,21 +678,8 @@ def main():
     # 加载配置
     config = load_config(args.config)
     
-    # 分布式训练设置
-    distributed_config = config['training']['distributed']
-    world_size = distributed_config['world_size'] if distributed_config['enabled'] else 1
-    
-    if distributed_config['enabled'] and world_size > 1:
-        # 多GPU分布式训练
-        mp.spawn(
-            train_process,
-            args=(world_size, config, args),
-            nprocs=world_size,
-            join=True
-        )
-    else:
-        # 单GPU或CPU训练
-        train_process(0, 1, config, args)
+    # 直接运行训练进程（torchrun会负责进程管理）
+    train_process(config, args)
 
 if __name__ == "__main__":
     main()
