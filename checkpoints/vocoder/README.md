@@ -1,0 +1,1 @@
+https://huggingface.co/ACE-Step/ACE-Step-v1-3.5B
