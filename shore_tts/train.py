@@ -143,10 +143,18 @@ def create_dataloader(config, rank, world_size, is_validation=False):
     else:
         sampler = None
     
+    # 设置batch_size：验证时使用更小的batch_size避免OOM
+    if is_validation:
+        # 优先使用验证专用配置
+        val_config = training_config.get('validation', {})
+        batch_size = val_config.get('batch_size', max(1, training_config['batch_size'] // 2))
+    else:
+        batch_size = training_config['batch_size']
+    
     # 创建数据加载器
     dataloader = data.DataLoader(
         dataset,
-        batch_size=training_config['batch_size'],
+        batch_size=batch_size,
         sampler=sampler,
         shuffle=(sampler is None and not is_validation),
         collate_fn=full_dataset.collate_fn,
@@ -194,25 +202,6 @@ def create_optimizer(model, config):
             )
         except ImportError:
             print("AdaFactor需要安装transformers库: pip install transformers")
-            # 回退到RMSprop
-            optimizer = optim.RMSprop(
-                model.parameters(),
-                lr=training_config['learning_rate'],
-                weight_decay=1e-6,
-                alpha=0.9
-            )
-    
-    elif training_config['optimizer'] == 'Lion':
-        # Lion: Google开发的内存高效优化器
-        try:
-            from lion_pytorch import Lion
-            optimizer = Lion(
-                model.parameters(),
-                lr=training_config['learning_rate'] * 0.1,  # Lion通常需要更小的学习率
-                weight_decay=1e-2  # Lion通常需要更大的weight_decay
-            )
-        except ImportError:
-            print("Lion需要安装lion-pytorch库: pip install lion-pytorch")
             # 回退到RMSprop
             optimizer = optim.RMSprop(
                 model.parameters(),
@@ -449,6 +438,11 @@ def validate_epoch(model, dataloader, config, rank):
     total_postnet_loss = 0
     total_stop_loss = 0
     
+    # 获取验证配置
+    val_config = config['training'].get('validation', {})
+    max_val_length = val_config.get('max_mel_length', min(1500, config['model']['max_mel_len']))
+    memory_efficient = val_config.get('memory_efficient', True)
+    
     # 只在主进程显示进度条
     if rank == 0:
         pbar = tqdm(dataloader, desc='Validation')
@@ -457,6 +451,10 @@ def validate_epoch(model, dataloader, config, rank):
     
     with torch.no_grad():
         for step, batch_data in enumerate(pbar):
+            # 清理GPU缓存
+            if memory_efficient and step % 10 == 0:  # 每10个batch清理一次
+                torch.cuda.empty_cache()
+            
             padded_mels, padded_phoneme_ids, mel_lengths, phoneme_lengths = batch_data
             
             # 将数据移动到GPU
@@ -469,32 +467,56 @@ def validate_epoch(model, dataloader, config, rank):
             # 转换mel格式: [batch, n_mels, max_len] -> [batch, max_len, n_mels]
             mel_targets = padded_mels.transpose(1, 2)
             
-            # 前向传播
-            mel_outputs, mel_outputs_postnet, stop_outputs, attention_weights = model(
-                phoneme_ids=padded_phoneme_ids,
-                phoneme_lengths=phoneme_lengths,
-                mel_target=mel_targets
-            )
+            # 限制验证时的最大长度，避免过长序列导致OOM
+            if mel_targets.shape[1] > max_val_length:
+                mel_targets = mel_targets[:, :max_val_length, :]
+                mel_lengths = torch.clamp(mel_lengths, max=max_val_length)
             
-            # 计算损失
-            loss, mel_loss, postnet_loss, stop_loss = compute_loss(
-                mel_outputs, mel_outputs_postnet, stop_outputs, mel_targets, mel_lengths
-            )
+            try:
+                # 前向传播
+                mel_outputs, mel_outputs_postnet, stop_outputs, attention_weights = model(
+                    phoneme_ids=padded_phoneme_ids,
+                    phoneme_lengths=phoneme_lengths,
+                    mel_target=mel_targets
+                )
+                
+                # 计算损失
+                loss, mel_loss, postnet_loss, stop_loss = compute_loss(
+                    mel_outputs, mel_outputs_postnet, stop_outputs, mel_targets, mel_lengths
+                )
+                
+                # 统计损失
+                total_loss += loss.item()
+                total_mel_loss += mel_loss.item()
+                total_postnet_loss += postnet_loss.item()
+                total_stop_loss += stop_loss.item()
+                
+                # 更新进度条
+                if rank == 0:
+                    pbar.set_postfix({
+                        'Val Loss': f'{loss.item():.4f}',
+                        'Mel': f'{mel_loss.item():.4f}',
+                        'Post': f'{postnet_loss.item():.4f}',
+                        'Stop': f'{stop_loss.item():.4f}'
+                    })
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    if rank == 0:
+                        print(f"跳过batch {step}，OOM错误: {e}")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
             
-            # 统计损失
-            total_loss += loss.item()
-            total_mel_loss += mel_loss.item()
-            total_postnet_loss += postnet_loss.item()
-            total_stop_loss += stop_loss.item()
-            
-            # 更新进度条
-            if rank == 0:
-                pbar.set_postfix({
-                    'Val Loss': f'{loss.item():.4f}',
-                    'Mel': f'{mel_loss.item():.4f}',
-                    'Post': f'{postnet_loss.item():.4f}',
-                    'Stop': f'{stop_loss.item():.4f}'
-                })
+            # 清理中间变量
+            if memory_efficient:
+                del mel_outputs, mel_outputs_postnet, stop_outputs, attention_weights
+                del padded_mels, padded_phoneme_ids, mel_targets, mel_lengths, phoneme_lengths
+    
+    # 最终清理GPU缓存
+    if memory_efficient:
+        torch.cuda.empty_cache()
     
     # 计算平均损失
     num_batches = len(dataloader)

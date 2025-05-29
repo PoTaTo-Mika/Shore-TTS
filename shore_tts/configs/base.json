@@ -21,7 +21,7 @@
     },
     "training":
     {
-        "batch_size": 2,
+        "batch_size": 1,
         "epochs": 50,
         "learning_rate": 1e-4,
         "gradient_accumulation_steps": 4,
@@ -32,6 +32,11 @@
         "val_split": 0.1,
         "save_best_model": true,
         "early_stopping_patience": 10,
+        "validation": {
+            "batch_size": 1,
+            "max_mel_length": 1500,
+            "memory_efficient": true
+        },
         "distributed":{
             "enabled": true,
             "world_size": 8, 
