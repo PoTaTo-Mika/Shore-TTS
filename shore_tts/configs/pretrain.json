@@ -1,0 +1,75 @@
+{
+  "seed": 42,
+  "ddp": {
+    "backend": "nccl"
+  },
+  "data": {
+    "data_path": "data/parquet",
+    "mdct_config": "shore_tts/configs/mdct.json",
+    "batch_size": 16,
+    "num_workers": 4,
+    "min_length": 100,
+    "max_length": 6000,
+    "shuffle_buffer": 1024,
+    "epoch_shuffle": true
+  },
+  "text": {
+    "tokenizer_path": "data/tokenizers/pinyin_vocab.json",
+    "polyphone": true
+  },
+  "model": {
+    "dit": {
+      "dim": 1024,
+      "depth": 22,
+      "heads": 16,
+      "dim_head": 64,
+      "dropout": 0.1,
+      "ff_mult": 2,
+      "text_dim": 512,
+      "text_mask_padding": false,
+      "text_embedding_average_upsampling": false,
+      "qk_norm": null,
+      "conv_layers": 4,
+      "pe_attn_head": 1,
+      "attn_backend": "torch",
+      "attn_mask_enabled": false,
+      "long_skip_connection": false,
+      "checkpoint_activations": false
+    },
+    "cfm": {
+      "sigma": 0.0,
+      "audio_drop_prob": 0.3,
+      "cond_drop_prob": 0.2,
+      "frac_lengths_mask": [
+        0.7,
+        1.0
+      ]
+    }
+  },
+  "optim": {
+    "lr": 0.00025,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "weight_decay": 0.01,
+    "grad_clip": 1.0
+  },
+  "scheduler": {
+    "warmup_steps": 1000,
+    "min_lr_scale": 0.1
+  },
+  "train": {
+    "epochs": 1000,
+    "max_steps": 1000000,
+    "log_every_steps": 10,
+    "timing_every_steps": 100,
+    "save_every_steps": 2000,
+    "save_dir": "checkpoints/pretrain",
+    "resume_from": "checkpoints/pretrain/step_00060000.pt",
+    "tensorboard": {
+      "enabled": true,
+      "log_dir": "checkpoints/pretrain/tensorboard"
+    }
+  }
+}
