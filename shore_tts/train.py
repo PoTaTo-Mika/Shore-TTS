@@ -13,7 +13,6 @@ if project_root not in sys.path:
 os.environ['PROJECT_ROOT'] = project_root
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 import warnings
@@ -22,16 +21,21 @@ warnings.filterwarnings("ignore")
 from shore_tts.utils.build import (
     build_model,
     build_optimizer,
+    build_precision_components,
     build_scheduler,
     build_train_dataloader,
+    build_train_writer,
     checkpoint_state,
     cleanup_distributed,
+    EMA,
     get_device,
     init_distributed,
     is_main_process,
-    load_checkpoint,
+    log_train_setup,
     load_json_config,
     move_batch_to_device,
+    resume_training_state,
+    save_sample_outputs,
     save_checkpoint,
     set_seed,
     wrap_ddp,
@@ -68,37 +72,20 @@ def main() -> None:
         dataloader = build_train_dataloader(config, rank=rank, world_size=world_size)
 
         train_cfg = config["train"]
+        ema = EMA(raw_model, decay=float(train_cfg.get("ema_decay", 0.9999)))
         save_dir = train_cfg["save_dir"]
         save_every_steps = int(train_cfg.get("save_every_steps", 1000))
+        keep_last_n_checkpoints = int(train_cfg.get("keep_last_n_checkpoints", -1))
         log_every_steps = int(train_cfg.get("log_every_steps", 10))
         timing_every_steps = int(train_cfg.get("timing_every_steps", 100))
         max_steps = int(train_cfg.get("max_steps", -1))
         grad_clip = float(config["optim"].get("grad_clip", 1.0))
-
-        writer = None
-        if is_main_process(rank) and train_cfg.get("tensorboard", {}).get("enabled", True):
-            log_dir = train_cfg.get("tensorboard", {}).get("log_dir", os.path.join(save_dir, "tensorboard"))
-            writer = SummaryWriter(log_dir=log_dir)
+        precision, allow_tf32, autocast_dtype, scaler = build_precision_components(config, device)
+        writer = build_train_writer(config, rank)
 
         progress = None
-        if is_main_process(rank):
-            total_params = sum(p.numel() for p in raw_model.parameters())
-            trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
-            tqdm.write(f"[model] total_params={total_params:,} trainable_params={trainable_params:,}")
-
-        start_epoch = 0
-        global_step = 0
-        resume_from = train_cfg.get("resume_from")
-        if resume_from:
-            start_epoch, global_step = load_checkpoint(
-                resume_from,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                map_location=device,
-            )
-            if is_main_process(rank):
-                tqdm.write(f"[resume] epoch={start_epoch} global_step={global_step} ckpt={resume_from}")
+        log_train_setup(raw_model, rank, precision, allow_tf32, device)
+        start_epoch, global_step = resume_training_state(config, model, optimizer, scheduler, device, rank, ema=ema)
 
         if is_main_process(rank):
             total_steps = max_steps if max_steps > 0 else None
@@ -153,18 +140,32 @@ def main() -> None:
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     gpu_start = time.perf_counter()
-                    loss, _, _ = model(
-                        inp=batch["specs"],
-                        text=batch["texts"],
-                        lens=batch["lengths"],
+                    autocast_context = (
+                        torch.autocast(device_type="cuda", dtype=autocast_dtype)
+                        if autocast_dtype is not None
+                        else nullcontext()
                     )
-                    loss.backward()
+                    with autocast_context:
+                        loss, _, _ = model(
+                            inp=batch["specs"],
+                            text=batch["texts"],
+                            lens=batch["lengths"],
+                        )
 
-                    if grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-                    optimizer.step()
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        if grad_clip > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        if grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        optimizer.step()
                     scheduler.step()
+                    ema.update(raw_model)
                     if device.type == "cuda":
                         torch.cuda.synchronize(device)
                     gpu_step_time = time.perf_counter() - gpu_start
@@ -215,15 +216,23 @@ def main() -> None:
                             timing_window[key] = 0.0 if key != "count" else 0
 
                     if is_main_process(rank) and save_every_steps > 0 and global_step % save_every_steps == 0:
-                        state = checkpoint_state(model, optimizer, scheduler, epoch, global_step, config)
-                        path = save_checkpoint(save_dir, state, f"step_{global_step:08d}.pt")
+                        state = checkpoint_state(model, optimizer, scheduler, epoch, global_step, config, ema=ema)
+                        path = save_checkpoint(
+                            save_dir,
+                            state,
+                            f"step_{global_step:08d}.pt",
+                            keep_last_n=keep_last_n_checkpoints,
+                        )
                         tqdm.write(f"[checkpoint] step={global_step} saved {path}")
+                        sample_paths = save_sample_outputs(model, ema, batch, config, save_dir, global_step, device)
+                        if sample_paths:
+                            tqdm.write(f"[samples] step={global_step} saved {' '.join(sample_paths)}")
 
                     if max_steps > 0 and global_step >= max_steps:
                         break
 
             if is_main_process(rank):
-                state = checkpoint_state(model, optimizer, scheduler, epoch + 1, global_step, config)
+                state = checkpoint_state(model, optimizer, scheduler, epoch + 1, global_step, config, ema=ema)
                 path = save_checkpoint(save_dir, state, "last.pt")
                 tqdm.write(f"[checkpoint] epoch={epoch + 1} step={global_step} saved {path}")
 
