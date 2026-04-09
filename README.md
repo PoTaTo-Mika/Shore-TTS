@@ -55,3 +55,15 @@ Shore-TTS(暂定命名), 期望实现以下两个突破：
 # 注意事项
 
 数据集读取是使用webdataset的，保证一个tar里面全是音频和对应的txt，脚本会自己递归地读子目录等一系列tar。
+
+如果目标是完整复刻 F5-TTS 的模型和训练流程，但把声学特征替换成 MDCT，那么目前还剩下这些关键工作：
+
+- 统一并固定训练配置。当前代码里的主干已经接近 `F5TTS_Base_MDCT`，但仓库默认配置仍然存在不一致之处；例如 `shore_tts/configs/mdct.json` 里还是 `sample_rate=44100`，而 `assets/F5-TTS/src/f5_tts/configs/F5TTS_Base_MDCT.yaml` 使用的是 `24000 / hop_length=100 / n_bands=20`。这部分需要先定成唯一真值。
+- 对齐数据契约。现在 `shore_tts/datasets/dataset.py` 走的是 tar 流式在线解码 + 在线 MDCT 提特征；F5-TTS 原版训练则依赖 `duration.json` 和可按帧长排序的数据集接口。若要完整复刻训练行为，需要补齐一套能提供样本时长统计、支持按帧长分桶的数据元信息，或者重写出 tar 版本的等价方案。
+- 补上 dynamic batch / frame-based batching。F5-TTS 的关键工程能力之一是按总帧数动态组 batch，而不是固定样本数；当前 `shore_tts/train.py` 仍然是固定 `batch_size`。这一点不补，长语音训练时的吞吐、显存利用率和稳定性都会明显落后于原版。
+- 对齐 Trainer 能力。当前仓库已经能训练，但还是“最小闭环”版本；还缺 F5-TTS 原版 Trainer 里的 `grad_accumulation_steps`、更严格的断点续训、按 update 计数的 warmup/decay、以及更完整的多卡训练抽象。
+- 规范 checkpoint / resume 语义。现在可以存取 checkpoint，但还没有完全做到和 F5-TTS 一样的“按 update 精确恢复训练进度，包括 dataloader 跳过位置和 batch sampler epoch 状态”。
+- 补 inference / finetune / eval 入口。当前仓库主要只有训练入口；如果要说“完整复刻流程”，还需要补 CLI 推理、批量推理、finetune 入口，以及基础评测脚本，至少要能覆盖 F5-TTS 仓库中 `infer/`、`train/finetune_*`、`eval/` 的核心使用路径。
+- 明确 MDCT 分支的训练目标边界。当前实现是直接把 F5-TTS 的 `CFM + DiT` 套到 MDCT 特征上，这已经是合理 baseline；但如果后续要进一步追平或超过 mel 方案，还需要继续验证 `log_mag + norm_spec` 的联合建模是否足够，是否要继续做解耦生成、x-prediction、或者时域辅助损失。
+
+简化地说：现在已经有“能训练的 F5-TTS/MDCT baseline”，但距离“完整复刻 F5-TTS 训练体系”还差数据分桶、动态 batch、完整 Trainer、精确续训、以及 inference / finetune / eval 配套入口。
