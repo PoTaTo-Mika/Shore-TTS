@@ -443,9 +443,10 @@ def save_sample_outputs(
         lens=torch.tensor([ref_len], device=device, dtype=torch.long),
     )
     generated = generated[:, ref_len:, :]
-    gen_audio = raw_model.spec.inverse(generated, length=generated.shape[1] * raw_model.spec.hop_length).cpu()
+    # generated/ref_spec are (B, T, D); MDCTSpec.inverse expects (B, F, T)
+    gen_audio = raw_model.spec.inverse(generated.permute(0, 2, 1), length=generated.shape[1] * raw_model.spec.hop_length).cpu()
     ref_audio = raw_model.spec.inverse(
-        ref_spec[:, :ref_len],
+        ref_spec[:, :ref_len].permute(0, 2, 1),
         length=ref_len * raw_model.spec.hop_length,
     ).cpu()
 

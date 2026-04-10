@@ -14,7 +14,7 @@
     "epoch_shuffle": true
   },
   "text": {
-    "tokenizer_path": "data/tokenizers/pinyin_vocab.json",
+    "tokenizer_path": "checkpoints/Shore-TTS-0.1/vocab.json",
     "polyphone": true
   },
   "model": {

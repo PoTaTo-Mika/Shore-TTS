@@ -6,5 +6,5 @@
     "audio_extensions": [".mp3", ".wav", ".m4a", ".ogg", ".opus"],
     "batch_size": 10000,
     "tar_prefix": "test",
-    "sample_rate": 44100
+    "sample_rate": 24000
 }

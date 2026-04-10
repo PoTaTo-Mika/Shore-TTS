@@ -1,14 +1,18 @@
-# For AI Coding Agents
+# Shore-TTS
 
-请先以代码现状为准，再参考后文的研究目标。当前仓库已经落地的是一条可训练的 baseline：
+基于 **BN-MDCT** 特征与 **CFM + DiT** 主干的非自回归语音合成系统。
 
-- 训练入口是 `shore_tts/train.py`。
-- 模型构建在 `shore_tts/utils/build.py`，当前主干是 `CFM + DiT`，对应 `shore_tts/models/cfm.py` 与 `shore_tts/models/dit.py`。
-- 数据管线在 `shore_tts/datasets/dataset.py`，使用 `webdataset` 递归扫描 `data_path` 下的 `*.tar` 分片，在线解码音频与文本，并即时计算 BN-MDCT 特征。
-- 特征提取配置在 `shore_tts/configs/mdct.json`，默认是 `sample_rate=44100`、`hop_length=441`、`n_bands=10`，对应特征维度 `451`。
-- 默认训练配置在 `shore_tts/configs/pretrain.json`，当前 `data.data_path` 是 `data/parquet`；虽然目录名叫 `parquet`，但代码实际读取的是其中递归存在的 tar shards，而不是 parquet 文件。
+Shore-TTS 的核心思路是：不依赖 vocoder 也不依赖音频 codec，而是让神经网络直接预测一种可由传统信号处理算法**无损复原**的声学特征——BN-MDCT 谱，从而从根本上消除 vocoder/codec 引入的音质损失。当前实现以 F5-TTS 为蓝本，将 mel 谱替换为 BN-MDCT，使用 Conditional Flow Matching 训练 DiT，已形成可训练的 baseline。
 
-因此，后面的“整体流程 / 后续研究”应视为研究说明，其中混有尚未实现或尚未定型的方案。编码时优先核对真实入口、配置和现有模块，不要把 README 里关于未来结构、采样脚本或实验分支的描述误当成已经可用的实现。
+**已实现：**
+- 训练入口 `shore_tts/train.py`，支持 DDP 多卡、EMA、混合精度、断点续训
+- CFM + DiT 模型主干（`shore_tts/models/cfm.py`、`dit.py`、`modules.py`）
+- BN-MDCT 特征提取与可逆重建（`shore_tts/utils/spectrogram.py`），当前配置 `sample_rate=24000 / hop_length=100 / n_bands=20`，特征维度 `120`
+- WebDataset 数据管线（`shore_tts/datasets/dataset.py`），在线解码 tar 分片并即时提取 MDCT
+- 拼音分词器（`shore_tts/text/tokenizer.py`），支持多音字
+- 推理与 voice cloning（`tools/inference.py`），支持参考音频 few-shot、CFG、sway sampling
+
+> **Note for AI Coding Agents：** 下文”整体流程 / 后续研究”包含尚未实现或尚未定型的方案，编码时请以代码现状为准，优先核对真实入口、配置和现有模块。
 
 # 整体流程
 
