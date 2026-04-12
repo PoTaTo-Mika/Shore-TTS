@@ -1,14 +1,12 @@
 {
   "seed": 42,
   "data": {
-    "data_path": "data/parquet",
+    "data_path": "/data/potato/Emilia/Emilia/test",
     "mdct_config": "shore_tts/configs/mdct.json",
-    "num_workers": 4,
+    "num_workers": 16,
     "min_length": 100,
     "max_length": 6000,
-    "tars_per_window": 30,
-    "max_frames_per_batch": 38400,
-    "max_samples_per_batch": 64,
+    "batch_size": 32,
     "epoch_shuffle": true
   },
   "text": {
@@ -79,7 +77,7 @@
       "duration_factor": 2.0
     },
     "save_dir": "checkpoints/pretrain",
-    "resume_from": "checkpoints/pretrain/step_00060000.pt",
+    "resume_from": "",
     "tensorboard": {
       "enabled": true,
       "log_dir": "checkpoints/pretrain/tensorboard"

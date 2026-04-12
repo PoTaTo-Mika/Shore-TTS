@@ -46,27 +46,6 @@ def _assign_tar_files_by_size(tar_files: List[str], world_size: int) -> List[Lis
     return assignments
 
 
-def _dynamic_batch(samples: List[dict], max_frames: int, max_samples: int = 0) -> List[List[dict]]:
-    """按帧长排序后贪心组批，保证每 batch 总帧数 ≤ max_frames。"""
-    if not samples:
-        return []
-    samples.sort(key=lambda s: s["spec"].shape[0])
-    batches, batch, batch_frames = [], [], 0
-    for s in samples:
-        fl = s["spec"].shape[0]
-        if batch_frames + fl <= max_frames and (max_samples == 0 or len(batch) < max_samples):
-            batch.append(s)
-            batch_frames += fl
-        else:
-            if batch:
-                batches.append(batch)
-            batch = [s] if fl <= max_frames else []
-            batch_frames = fl if fl <= max_frames else 0
-    if batch:
-        batches.append(batch)
-    return batches
-
-
 def _collate_batch(samples: List[dict]) -> dict:
     """零填充组批。返回 specs(B,T,F), lengths(B), mask(B,T), texts。"""
     specs = [s["spec"] for s in samples]
@@ -92,9 +71,7 @@ class ShoreDataset(IterableDataset):
         n_bands: Optional[int] = None,
         min_length: int = 10,
         max_length: int = 1000,
-        tars_per_window: int = 4,
-        max_frames_per_batch: int = 60000,
-        max_samples_per_batch: int = 0,
+        batch_size: int = 32,
         epoch_shuffle: bool = True,
         rank: int = 0,
         world_size: int = 1,
@@ -106,9 +83,7 @@ class ShoreDataset(IterableDataset):
         self.sample_rate = sample_rate or cfg.get("sample_rate", 22050)
         self.min_length = min_length
         self.max_length = max_length
-        self.tars_per_window = tars_per_window
-        self.max_frames = max_frames_per_batch
-        self.max_samples = max_samples_per_batch
+        self.batch_size = batch_size
         self.epoch_shuffle = epoch_shuffle
         self.rank = rank
         self.world_size = world_size
@@ -164,9 +139,6 @@ class ShoreDataset(IterableDataset):
             return None
         return {"spec": spec, "text": text}
 
-    def _load_window(self, tars: List[str]) -> List[dict]:
-        return [s for s in (self._decode_sample(x) for x in wds.WebDataset(tars, shardshuffle=0)) if s is not None]
-
     def __iter__(self):
         tar_files = list(self.tar_files)
         if self.epoch_shuffle:
@@ -181,17 +153,21 @@ class ShoreDataset(IterableDataset):
         if not tar_files:
             return
 
-        rng = random.Random(self._epoch * 9973 + self.rank + (wi.id * 31 if wi else 0))
-
-        for i in range(0, len(tar_files), self.tars_per_window):
-            window = tar_files[i : i + self.tars_per_window]
-            samples = self._load_window(window)
-            if not samples:
+        # 纯流式：逐样本从 tar 流中读取，攒够 batch_size 就 yield
+        stream = wds.WebDataset(tar_files, shardshuffle=len(tar_files) if self.epoch_shuffle else 0)
+        buf: List[dict] = []
+        for raw in stream:
+            decoded = self._decode_sample(raw)
+            if decoded is None:
                 continue
-            batches = _dynamic_batch(samples, self.max_frames, self.max_samples)
-            rng.shuffle(batches)
-            for batch in batches:
-                yield _collate_batch(batch)
+            buf.append(decoded)
+            if len(buf) >= self.batch_size:
+                yield _collate_batch(buf)
+                buf = []
+
+        # 收尾：不足一个 batch 的剩余样本也 yield
+        if buf:
+            yield _collate_batch(buf)
 
 
 def collate_fn(batch):
@@ -207,9 +183,7 @@ def build_dataloader(
     n_bands: Optional[int] = None,
     min_length: int = 10,
     max_length: int = 1000,
-    tars_per_window: int = 4,
-    max_frames_per_batch: int = 60000,
-    max_samples_per_batch: int = 0,
+    batch_size: int = 32,
     num_workers: int = 4,
     epoch_shuffle: bool = True,
     rank: int = 0,
@@ -223,9 +197,7 @@ def build_dataloader(
         n_bands=n_bands,
         min_length=min_length,
         max_length=max_length,
-        tars_per_window=tars_per_window,
-        max_frames_per_batch=max_frames_per_batch,
-        max_samples_per_batch=max_samples_per_batch,
+        batch_size=batch_size,
         epoch_shuffle=epoch_shuffle,
         rank=rank,
         world_size=world_size,
