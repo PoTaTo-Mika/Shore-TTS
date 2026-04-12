@@ -292,6 +292,7 @@ def build_dataloader(
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
 
 

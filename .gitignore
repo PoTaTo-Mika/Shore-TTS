@@ -212,3 +212,4 @@ F5-TTS/
 checkpoints/
 *.wav
 *.npy
+.claude

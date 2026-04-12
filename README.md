@@ -2,7 +2,9 @@
 
 基于 **BN-MDCT** 特征与 **CFM + DiT** 主干的非自回归语音合成系统。
 
-Shore-TTS 的核心思路是：不依赖 vocoder 也不依赖音频 codec，而是让神经网络直接预测一种可由传统信号处理算法**无损复原**的声学特征——BN-MDCT 谱，从而从根本上消除 vocoder/codec 引入的音质损失。当前实现以 F5-TTS 为蓝本，将 mel 谱替换为 BN-MDCT，使用 Conditional Flow Matching 训练 DiT，已形成可训练的 baseline。
+Shore-TTS 的核心思路是：不依赖 vocoder 也不依赖音频 codec，而是让神经网络直接预测一种可由传统信号处理算法**无损复原**的声学特征——BN-MDCT 谱，从而从根本上消除 vocoder/codec 引入的音质损失。当前实现以 F5-TTS 为蓝本，将 mel 谱替换为 BN-MDCT，使用 Conditional Flow Matching 训练 DiT。
+
+目前已经跑通了！也可以生成音频了！唯一的缺陷就是音质和表现力不够强，一旦这两个够了，对于语音来说也够一个 ICML Oral 了。
 
 **已实现：**
 - 训练入口 `shore_tts/train.py`，支持 DDP 多卡、EMA、混合精度、断点续训
@@ -16,58 +18,71 @@ Shore-TTS 的核心思路是：不依赖 vocoder 也不依赖音频 codec，而�
 
 # 整体流程
 
-传统的TTS依赖于vocoder, 即使是端到端训练的VITS, 里面也有一个hifigan作为最后的音频生成, 而fish-speech这种则是选择使用audio codec进行编解码, 采用了压缩的思想。
+## 1. 数据准备
 
-Shore-TTS(暂定命名), 期望实现以下两个突破：
+原始数据为 **WebDataset** 格式的 tar 分片，每个 tar 中包含配对的音频文件（`.opus`/`.wav`/`.flac` 等）与对应文本（`.txt`）。使用 `tools/pack.py` 可将多卷 tar 归档转换为标准 WebDataset 分片：
 
-- 不需要vocoder，直接预测一种完全可以用传统算法无损复原的特征。
-- 不进行压缩，保留原始信息从而解决音质问题。(可能无法做到)
+```
+python tools/pack.py --input data.tar.* --output_dir shards/ --samples_per_shard 10000
+```
 
-## Stage 1 : 传统信号处理
+## 2. 特征提取（BN-MDCT）
 
-首先我们给定一系列的音频 audio -> [wav], 经过BN-MDCT处理(此处等同于以前对音频计算log-mel spectrogram的作用), 得到 D谱 -> [npy][range主要在-3到+3之间], D谱本身可逆, 参考[脚本](./shore_tts/utils/spectrogram.py)。
+训练时在线提取，无需离线预处理。核心特征为 **BN-MDCT（Band-Normalized MDCT）**，定义于 `shore_tts/utils/spectrogram.py`：
 
-## Stage 2 : 神经网络骨干
+1. 对音频做 MDCT 变换（`hop_length=100, n_fft=200`），得到 100 维频谱系数
+2. 将频带划分为 20 个子带，计算各子带能量包络
+3. 用能量包络对系数做归一化，拼接 log 能量 + 归一化系数 → **120 维特征**
+4. 逆过程可**无损还原**波形（MDCT 本身是完美重构变换）
 
-参考 F5-TTS 的做法，我们不显式使用音素和时长预测，这直接解决掉了最烦且老旧的部分，我们选择直接使用 self attention 的方式，用 concat 拼接拼音 token 序列和 D谱 特征，举例如下：
+配置见 `shore_tts/configs/mdct.json`。
 
-原始音频经过提取后变成 [1,114,51] 大小的特征，注意到时间尺度上长度为 114 帧，那么整个序列的长度都是 114 帧。假设输入文本包含中文，那么会先被转换为类似 F5-TTS 的拼音 token 序列，再与音频特征在时间维上对齐。然后 F5-TTS 采用了一个绝对正弦波位置编码处理文本序列，随后这个张量被送到 ConvNeXt V2 Block 里面，block 输出一个 [114,音频特征维度] 的张量。不过他们的做法是在此之后进行叠加，拼接一个 [114,文本特征维度+音频特征维度] 的张量出来，我们这里可以考虑在序列层次上做叠加。**(后面可能要做实验)**
+## 3. 文本处理
 
-随后我们要通过一系列神经网络进行处理，最终实现TTS的效果。目前有如下方案：
+中文文本经 `rjieba` 分词后由 `pypinyin` 转为带声调拼音（`shore_tts/text/tokenizer.py`），如"你好"→`ni3 hao3`；非中文字符原样保留。词表（`vocab.json`，2625 token）在训练时构建，涵盖拼音音节、ASCII 字符及多语种字符。
 
-- 用一种类似vocoder的思路，先使用一个简单的Pre-Net对 D谱 进行降维，然后用DiT预测降维后的信息，之后用一个PostNet复原为 D谱。
-- 先使用RealNVP类似的可逆神经网络进行处理, 让 D谱 -> [npy] 变成同等大小的、扩散模型友好的特征 DF(Diffusion Friendly) -> [tensor], 之后采用一个较大的 DiT 网络进行端到端(期望)扩散学习。这样只需要一个 DiT 主干就能生成 DF，过逆 Flow 还原 D谱, 之后可以快速用传统算法反推波形。
-- 引入复数域，采用 MCLT (Modulated Complex Lapped Transform) 扩展特征。由于纯 MDCT 极其依赖前后帧的 TDAC (时域混叠消除) 约束，扩散模型微小的预测误差就会打破这种平衡，导致刺耳的伪影（如预回声或金属音）。在此方案中，我们将 MDCT（实部）与 MDST（虚部）结合构成复数域特征。骨干网络（如 DiT 或 Flow Matching）不再痛苦地拟合极其严格的 TDAC 约束，而是去预测具备“平移不变性”的复数频谱（或极坐标下的幅度和相位导数）。这样不仅大大降低了模型的拟合难度，还能在损失函数设计上直接对齐音频的物理规律，最终通过提取实部并执行逆变换，完美重建无伪影的高质量波形。
-- 采用解耦级联生成 (Decoupled & Cascaded Generation)。Stage 1 提取的 D谱 实际上已被解耦为结构性极强的“频带包络 (log_mag)”和缺乏平滑结构约束的“归一化残差频谱 (norm_spec)”。包络决定了语音的清晰度、语调和共振峰，极易被网络学习；而残差包含高频细节，直接拟合容易导致高频丢失。在此方案中，我们构建两级生成范式：
-    1. **Base Model**: 负责基于文本/音素特征，精准预测低维度的 `log_mag` 能量包络。
-    2. **Condition Model**: 以预测出的 `log_mag` 为条件（Condition），指导网络生成高维的精细特征 `norm_spec`。
-    更重要的是，得益于 Stage 1 算子的全 PyTorch 可微实现，在训练阶段，我们可以直接让梯度穿过 `BN-MDCT` 逆变换器，在时域上计算 STFT Loss 或引入轻量级鉴别器（Discriminator, 同时可以考虑GAN的对抗蒸馏）
+## 4. 训练
 
-## Stage 3 : 重建音频
+入口：`shore_tts/train.py`，配置：`shore_tts/configs/pretrain.json`。
 
-由于现在大伙都引入了few-shot开卷，所以我们在可以出声的基础上额外加入一个小目标：引入speaker embedding进行类似cosyvoice的那种few-shot。
+**模型架构**：CFM（Conditional Flow Matching）+ DiT（Diffusion Transformer）
 
-不过这一阶段主要的行为依然是把 D谱 -> [npy] 转换为 fake_audio -> [wav]，其中的ODE求解器我们就用Euler即可。
+```
+文本 ──→ 拼音嵌入 + ConvNeXtV2 ──→ 文本编码
+                                          ┐
+噪声 BN-MDCT + 条件 BN-MDCT + 文本编码 ──→ DiT (×22 层) ──→ 预测流场
+                                          ┘
+      时间步嵌入 (AdaLN 调制)
+```
 
-# 后续研究
+**训练目标**：对目标 BN-MDCT 特征施加随机掩码（span masking），在噪声与目标之间线性插值 `φ_t = (1-t)·ε + t·x`，让模型预测流场 `v = x - ε`，仅在掩码区域计算 MSE 损失。
 
-- 引入解耦生成
-- 引入x-prediction
-- 优化模型表现力，测试scaling效果
+**CFG 训练**：以 0.3 概率丢弃音频条件、0.2 概率同时丢弃音频与文本条件，用于推理时 Classifier-Free Guidance。
+
+**训练设置**：AdamW (lr=2.5e-4) + 线性 warmup 1000 步 + 线性衰减、EMA (0.9999)、混合精度 fp16、DDP 多卡、梯度裁剪 (max_norm=1.0)、每 2000 步存检查点（保留最近 10 个）。
+
+## 5. 推理
+
+入口：`tools/inference.py`。
+
+```
+参考音频 ──→ BN-MDCT 编码 ──→ 条件特征
+参考文本 + 目标文本 ──→ 拼音序列 ──→ 文本编码
+                                          ┐
+随机噪声 ──────────────────────────────→ ODE 求解 (32步) ──→ 生成 BN-MDCT
+                                          ┘
+      条件特征 + 文本编码 + CFG
+```
+
+1. 加载检查点（`config.json` + `vocab.json` + `model.pth`）
+2. 参考音频 → BN-MDCT 特征作为条件
+3. 根据参考音频时长估算目标时长（约每拼音 6 帧 MDCT）
+4. ODE 采样（默认 32 步），支持 CFG、sway sampling、EPSS 加速
+5. 截取生成部分，逆 BN-MDCT 还原为波形，保存 WAV
 
 
-# 注意事项
+# TO DO LIST
 
-数据集读取是使用webdataset的，保证一个tar里面全是音频和对应的txt，脚本会自己递归地读子目录等一系列tar。
-
-如果目标是完整复刻 F5-TTS 的模型和训练流程，但把声学特征替换成 MDCT，那么目前还剩下这些关键工作：
-
-- 统一并固定训练配置。当前代码里的主干已经接近 `F5TTS_Base_MDCT`，但仓库默认配置仍然存在不一致之处；例如 `shore_tts/configs/mdct.json` 里还是 `sample_rate=44100`，而 `assets/F5-TTS/src/f5_tts/configs/F5TTS_Base_MDCT.yaml` 使用的是 `24000 / hop_length=100 / n_bands=20`。这部分需要先定成唯一真值。
-- 对齐数据契约。现在 `shore_tts/datasets/dataset.py` 走的是 tar 流式在线解码 + 在线 MDCT 提特征；F5-TTS 原版训练则依赖 `duration.json` 和可按帧长排序的数据集接口。若要完整复刻训练行为，需要补齐一套能提供样本时长统计、支持按帧长分桶的数据元信息，或者重写出 tar 版本的等价方案。
-- 补上 dynamic batch / frame-based batching。F5-TTS 的关键工程能力之一是按总帧数动态组 batch，而不是固定样本数；当前 `shore_tts/train.py` 仍然是固定 `batch_size`。这一点不补，长语音训练时的吞吐、显存利用率和稳定性都会明显落后于原版。
-- 对齐 Trainer 能力。当前仓库已经能训练，但还是“最小闭环”版本；还缺 F5-TTS 原版 Trainer 里的 `grad_accumulation_steps`、更严格的断点续训、按 update 计数的 warmup/decay、以及更完整的多卡训练抽象。
-- 规范 checkpoint / resume 语义。现在可以存取 checkpoint，但还没有完全做到和 F5-TTS 一样的“按 update 精确恢复训练进度，包括 dataloader 跳过位置和 batch sampler epoch 状态”。
-- 补 inference / finetune / eval 入口。当前仓库主要只有训练入口；如果要说“完整复刻流程”，还需要补 CLI 推理、批量推理、finetune 入口，以及基础评测脚本，至少要能覆盖 F5-TTS 仓库中 `infer/`、`train/finetune_*`、`eval/` 的核心使用路径。
-- 明确 MDCT 分支的训练目标边界。当前实现是直接把 F5-TTS 的 `CFM + DiT` 套到 MDCT 特征上，这已经是合理 baseline；但如果后续要进一步追平或超过 mel 方案，还需要继续验证 `log_mag + norm_spec` 的联合建模是否足够，是否要继续做解耦生成、x-prediction、或者时域辅助损失。
-
-简化地说：现在已经有“能训练的 F5-TTS/MDCT baseline”，但距离“完整复刻 F5-TTS 训练体系”还差数据分桶、动态 batch、完整 Trainer、精确续训、以及 inference / finetune / eval 配套入口。
+- 去除F5的低效实现，参考F5的思路，但是提高里面的各种效率，加快收敛速度。
+- 加muon作为训练的优化器，去除AdamW的低效训练速度。
+- 加入hifigan里面的MPD作为判别器，提升模型音质效果。
