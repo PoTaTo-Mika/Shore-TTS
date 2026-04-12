@@ -3,11 +3,12 @@
   "data": {
     "data_path": "data/parquet",
     "mdct_config": "shore_tts/configs/mdct.json",
-    "batch_size": 16,
     "num_workers": 4,
     "min_length": 100,
     "max_length": 6000,
-    "shuffle_buffer": 1024,
+    "tars_per_window": 30,
+    "max_frames_per_batch": 38400,
+    "max_samples_per_batch": 0,
     "epoch_shuffle": true
   },
   "text": {

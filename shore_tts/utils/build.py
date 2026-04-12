@@ -138,14 +138,15 @@ def build_train_dataloader(config: dict[str, Any], accelerator: Accelerator):
     data_cfg = config["data"]
     return build_dataloader(
         data_path=data_cfg["data_path"],
-        batch_size=int(data_cfg.get("batch_size", 8)),
         config_path=data_cfg["mdct_config"],
         sample_rate=data_cfg.get("sample_rate"),
         hop_length=data_cfg.get("hop_length"),
         n_bands=data_cfg.get("n_bands"),
         min_length=int(data_cfg.get("min_length", 10)),
         max_length=int(data_cfg.get("max_length", 1000)),
-        shuffle_buffer=int(data_cfg.get("shuffle_buffer", 1000)),
+        tars_per_window=int(data_cfg.get("tars_per_window", 4)),
+        max_frames_per_batch=int(data_cfg.get("max_frames_per_batch", 60000)),
+        max_samples_per_batch=int(data_cfg.get("max_samples_per_batch", 0)),
         num_workers=int(data_cfg.get("num_workers", 4)),
         epoch_shuffle=bool(data_cfg.get("epoch_shuffle", True)),
         rank=accelerator.process_index,
