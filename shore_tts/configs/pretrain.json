@@ -8,7 +8,7 @@
     "max_length": 6000,
     "tars_per_window": 30,
     "max_frames_per_batch": 38400,
-    "max_samples_per_batch": 0,
+    "max_samples_per_batch": 64,
     "epoch_shuffle": true
   },
   "text": {
@@ -24,7 +24,7 @@
       "dropout": 0.1,
       "ff_mult": 2,
       "text_dim": 512,
-      "text_mask_padding": false,
+      "text_mask_padding": true,
       "text_embedding_average_upsampling": false,
       "qk_norm": null,
       "conv_layers": 4,
@@ -45,19 +45,19 @@
     }
   },
   "optim": {
-    "lr": 0.00025,
+    "lr": 7.5e-5,
     "betas": [
       0.9,
       0.95
     ],
     "fused": true,
-    "weight_decay": 0.01,
+    "weight_decay": 0.00,
     "grad_clip": 1.0
   },
   "scheduler": {
-    "warmup_steps": 1000,
+    "warmup_steps": 20000,
     "warmup_start_factor": 1e-8,
-    "final_lr_scale": 0.1
+    "final_lr_scale": 1e-8
   },
   "train": {
     "epochs": 1000,
