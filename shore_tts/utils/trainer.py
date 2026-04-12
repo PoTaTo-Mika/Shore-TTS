@@ -285,7 +285,10 @@ class Trainer:
 
         # Calculate starting epoch from update count
         grad_accum = self.accelerator.gradient_accumulation_steps
-        steps_per_epoch = len(train_dataloader) if hasattr(train_dataloader, "__len__") else None
+        try:
+            steps_per_epoch = len(train_dataloader)
+        except TypeError:
+            steps_per_epoch = None
         if steps_per_epoch is not None:
             start_epoch = (start_update * grad_accum) // steps_per_epoch
             skipped_batches = (start_update * grad_accum) % steps_per_epoch
