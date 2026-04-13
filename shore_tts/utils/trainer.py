@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs
 
 from shore_tts.utils.build import (
     build_optimizer,
@@ -44,6 +44,11 @@ class Trainer:
         self.accelerator = Accelerator(
             mixed_precision=mixed_precision,
             gradient_accumulation_steps=grad_accum,
+            dataloader_config=DataLoaderConfiguration(
+                split_batches=False,
+                dispatch_batches=False,
+                even_batches=False,
+            ),
             kwargs_handlers=[ddp_kwargs],
         )
 

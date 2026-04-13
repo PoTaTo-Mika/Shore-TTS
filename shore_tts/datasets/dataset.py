@@ -18,6 +18,11 @@ _DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "mdct
 _AUDIO_KEYS = ("wav", "flac", "mp3", "m4a", "ogg", "opus")
 
 
+def _identity_splitter(src, group=None):
+    """Use the shard list as-is when partitioning is already handled upstream."""
+    yield from src
+
+
 def _load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -147,14 +152,15 @@ class ShoreDataset(IterableDataset):
         if self.world_size > 1:
             tar_files = _assign_tar_files_by_size(tar_files, self.world_size)[self.rank]
 
-        wi = torch.utils.data.get_worker_info()
-        if wi is not None:
-            tar_files = tar_files[wi.id :: wi.num_workers]
         if not tar_files:
             return
 
-        # 纯流式：逐样本从 tar 流中读取，攒够 batch_size 就 yield
-        stream = wds.WebDataset(tar_files, shardshuffle=len(tar_files) if self.epoch_shuffle else 0)
+        # Rank-level shard assignment is handled above; let WebDataset only split by DataLoader worker.
+        stream = wds.WebDataset(
+            tar_files,
+            shardshuffle=len(tar_files) if self.epoch_shuffle else 0,
+            nodesplitter=_identity_splitter,
+        )
         buf: List[dict] = []
         for raw in stream:
             decoded = self._decode_sample(raw)
