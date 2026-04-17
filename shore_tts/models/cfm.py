@@ -13,6 +13,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
 
 from shore_tts.models.modules import MDCTSpec
+from shore_tts.utils.loss import FrequencyWeightedMSELoss
 from shore_tts.models.utils import (
     default,
     exists,
@@ -40,6 +41,7 @@ class CFM(nn.Module):
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
         text_tokenizer = None,
+        freq_weight_alpha: float = 0.5,
     ):
         super().__init__()
 
@@ -50,6 +52,9 @@ class CFM(nn.Module):
         self.spec = default(spec_module, MDCTSpec(**spec_kwargs))
         num_channels = default(num_channels, self.spec.num_channels)
         self.num_channels = num_channels
+
+        # Frequency-weighted loss (alpha=0 recovers uniform MSE)
+        self.loss_fn = FrequencyWeightedMSELoss(num_channels, alpha=freq_weight_alpha)
 
         # classifier-free guidance
         self.audio_drop_prob = audio_drop_prob
@@ -297,8 +302,7 @@ class CFM(nn.Module):
             x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
         )
 
-        # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
+        # flow matching loss (frequency-weighted)
+        loss = self.loss_fn(pred, flow, mask=rand_span_mask)
 
-        return loss.mean(), cond, pred
+        return loss, cond, pred

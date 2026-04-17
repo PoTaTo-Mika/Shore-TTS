@@ -15,6 +15,7 @@ from accelerate import Accelerator
 from shore_tts.datasets.dataset import build_dataloader
 from shore_tts.models.cfm import CFM
 from shore_tts.models.dit import DiT
+from shore_tts.optimizer.muon import Muon_AdamW
 from shore_tts.text.tokenizer import PinyinTokenizer
 
 
@@ -82,19 +83,36 @@ def build_model(config: dict[str, Any]) -> CFM:
     return model
 
 
-def build_optimizer(config: dict[str, Any], model: torch.nn.Module) -> AdamW:
+def build_optimizer(config: dict[str, Any], model: torch.nn.Module):
     optim_cfg = config["optim"]
-    fused = bool(optim_cfg.get("fused", True)) and torch.cuda.is_available()
-    return AdamW(
-        model.parameters(),
-        lr=float(optim_cfg.get("lr", 2e-4)),
-        betas=tuple(optim_cfg.get("betas", [0.9, 0.95])),
-        weight_decay=float(optim_cfg.get("weight_decay", 0.0)),
-        fused=fused,
-    )
+    optimizer_type = optim_cfg.get("optimizer_type", "adamw")
+    lr = float(optim_cfg.get("lr", 2e-4))
+    weight_decay = float(optim_cfg.get("weight_decay", 0.0))
+
+    if optimizer_type == "adamw":
+        fused = bool(optim_cfg.get("fused", True)) and torch.cuda.is_available()
+        return AdamW(
+            model.parameters(),
+            lr=lr,
+            betas=tuple(optim_cfg.get("betas", [0.9, 0.95])),
+            weight_decay=weight_decay,
+            fused=fused,
+        )
+    elif optimizer_type == "muon_adamw":
+        muon_args = optim_cfg.get("muon_args", {})
+        adamw_args = optim_cfg.get("adamw_args", {})
+        return Muon_AdamW(
+            model,
+            lr=lr,
+            weight_decay=weight_decay,
+            muon_args=muon_args,
+            adamw_args=adamw_args,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer_type: {optimizer_type!r}")
 
 
-def build_scheduler(config: dict[str, Any], optimizer: AdamW, num_processes: int = 1):
+def build_scheduler(config: dict[str, Any], optimizer, num_processes: int = 1):
     sched_cfg = config.get("scheduler", {})
     warmup_steps = int(sched_cfg.get("warmup_steps", 0)) * num_processes
     final_lr_scale = float(sched_cfg.get("final_lr_scale", sched_cfg.get("min_lr_scale", 0.1)))
