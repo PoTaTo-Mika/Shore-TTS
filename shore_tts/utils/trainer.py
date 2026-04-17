@@ -61,6 +61,8 @@ class Trainer:
         self.log_every_steps = int(train_cfg.get("log_every_steps", 10))
         self.max_grad_norm = float(optim_cfg.get("grad_clip", 1.0))
         self.checkpoint_path = train_cfg.get("save_dir", "checkpoints")
+        self.randomize_data_on_resume = bool(train_cfg.get("randomize_data_on_resume", True))
+        self.data_cycle_seed = 0
         self.config = config
 
         # Optimizer & scheduler (before prepare)
@@ -107,49 +109,49 @@ class Trainer:
 
     def save_checkpoint(self, update: int, epoch: int = 0, last: bool = False) -> None:
         self.accelerator.wait_for_everyone()
-        if not self.is_main:
-            return
+        if self.is_main:
+            raw_model = self.accelerator.unwrap_model(self.model)
+            state = {
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "epoch": epoch,
+                "update": update,
+                "data_seed": self.data_cycle_seed,
+            }
+            if self.ema_model is not None:
+                state["ema_model_state_dict"] = self.ema_model.state_dict()
 
-        raw_model = self.accelerator.unwrap_model(self.model)
-        state = {
-            "model_state_dict": raw_model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "epoch": epoch,
-            "update": update,
-        }
-        if self.ema_model is not None:
-            state["ema_model_state_dict"] = self.ema_model.state_dict()
+            Path(self.checkpoint_path).mkdir(parents=True, exist_ok=True)
 
-        Path(self.checkpoint_path).mkdir(parents=True, exist_ok=True)
+            if last:
+                # model_last.pt — lightweight, just model weights for quick resume
+                self.accelerator.save(state, f"{self.checkpoint_path}/model_last.pt")
+                print(f"Saved last checkpoint at update {update}")
+            else:
+                # Full checkpoint folder
+                ckpt_dir = f"{self.checkpoint_path}/step_{update:08d}"
+                Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
-        if last:
-            # model_last.pt — lightweight, just model weights for quick resume
-            self.accelerator.save(state, f"{self.checkpoint_path}/model_last.pt")
-            print(f"Saved last checkpoint at update {update}")
-        else:
-            # Full checkpoint folder
-            ckpt_dir = f"{self.checkpoint_path}/step_{update:08d}"
-            Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+                # 1) Save model weights
+                self.accelerator.save(state, f"{ckpt_dir}/model.pt")
 
-            # 1) Save model weights
-            self.accelerator.save(state, f"{ckpt_dir}/model.pt")
+                # 2) Save training config
+                config_path = os.path.join(ckpt_dir, "config.json")
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(self.config, f, indent=2, ensure_ascii=False)
 
-            # 2) Save training config
-            config_path = os.path.join(ckpt_dir, "config.json")
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
+                # 3) Copy vocab.json from tokenizer_path
+                tokenizer_path = self.config.get("text", {}).get("tokenizer_path")
+                if tokenizer_path and os.path.exists(tokenizer_path):
+                    shutil.copy2(tokenizer_path, os.path.join(ckpt_dir, "vocab.json"))
 
-            # 3) Copy vocab.json from tokenizer_path
-            tokenizer_path = self.config.get("text", {}).get("tokenizer_path")
-            if tokenizer_path and os.path.exists(tokenizer_path):
-                shutil.copy2(tokenizer_path, os.path.join(ckpt_dir, "vocab.json"))
+                print(f"[checkpoint] update={update} saved {ckpt_dir}/")
 
-            print(f"[checkpoint] update={update} saved {ckpt_dir}/")
-
-            # Rotate old checkpoint folders
-            if self.keep_last_n_checkpoints > 0:
-                self._rotate_checkpoints()
+                # Rotate old checkpoint folders
+                if self.keep_last_n_checkpoints > 0:
+                    self._rotate_checkpoints()
+        self.accelerator.wait_for_everyone()
 
     def _rotate_checkpoints(self) -> None:
         ckpt_dirs = sorted(
@@ -205,6 +207,7 @@ class Trainer:
                 self.ema_model.load_state_dict(checkpoint[ema_key])
 
         update = int(checkpoint.get("update", checkpoint.get("global_step", 0)))
+        self.data_cycle_seed = int(checkpoint.get("data_seed", update))
         del checkpoint
         gc.collect()
 
@@ -212,6 +215,34 @@ class Trainer:
             print(f"[resume] update={update} ckpt={resume_from}")
 
         return update
+
+    def _broadcast_data_seed(self, seed: int) -> int:
+        if self.accelerator.num_processes <= 1:
+            return int(seed)
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return int(seed)
+
+        seed_tensor = torch.tensor([seed], device=self.accelerator.device, dtype=torch.long)
+        torch.distributed.broadcast(seed_tensor, src=0)
+        return int(seed_tensor.item())
+
+    def _resolve_data_seed(self, start_update: int) -> int:
+        resume_from = self.config["train"].get("resume_from")
+        resumed = bool(resume_from and os.path.exists(resume_from))
+        if not resumed:
+            return 0
+        if not self.randomize_data_on_resume:
+            return self.data_cycle_seed
+
+        seed = 0
+        if self.is_main:
+            seed = int(torch.randint(0, 2**31 - 1, (1,), dtype=torch.int64).item())
+        seed = self._broadcast_data_seed(seed)
+
+        if self.is_main:
+            print(f"[resume] randomize_data_on_resume=True data_seed={seed} update={start_update}")
+
+        return seed
 
     @torch.no_grad()
     def _save_sample_outputs(self, batch: dict, global_update: int) -> list[str]:
@@ -221,6 +252,18 @@ class Trainer:
         sample_cfg = self.config["train"].get("log_samples", {})
         if not sample_cfg.get("enabled", False):
             return []
+
+        max_sample_frames = int(sample_cfg.get("max_sample_frames", 4800))
+        eligible = (batch["lengths"] < max_sample_frames).nonzero(as_tuple=False).flatten()
+        if eligible.numel() == 0:
+            print(
+                f"[samples] update={global_update} skipped: "
+                f"no sample shorter than {max_sample_frames} frames in current batch"
+            )
+            return []
+
+        sample_index = int(sample_cfg.get("sample_index", 0))
+        sample_index = int(eligible[sample_index % eligible.numel()].item())
 
         raw_model = self.accelerator.unwrap_model(self.model)
         original_state = None
@@ -235,8 +278,6 @@ class Trainer:
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         device = self.accelerator.device
-        sample_index = int(sample_cfg.get("sample_index", 0))
-        sample_index = min(sample_index, batch["specs"].shape[0] - 1)
         ref_spec = batch["specs"][sample_index : sample_index + 1]
         ref_len = int(batch["lengths"][sample_index].item())
         ref_text = batch["texts"][sample_index]
@@ -288,22 +329,9 @@ class Trainer:
         start_update = self.load_checkpoint()
         global_update = start_update
 
-        # Calculate starting epoch from update count
-        grad_accum = self.accelerator.gradient_accumulation_steps
-        try:
-            steps_per_epoch = len(train_dataloader)
-        except TypeError:
-            steps_per_epoch = None
-        if steps_per_epoch is not None:
-            start_epoch = (start_update * grad_accum) // steps_per_epoch
-            skipped_batches = (start_update * grad_accum) % steps_per_epoch
-        else:
-            start_epoch = 0
-            skipped_batches = 0
-
-        # Skip already-processed batches on resume
-        if start_update > 0 and skipped_batches > 0:
-            train_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batches)
+        self.data_cycle_seed = self._resolve_data_seed(start_update)
+        if hasattr(train_dataloader, "dataset") and hasattr(train_dataloader.dataset, "set_epoch"):
+            train_dataloader.dataset.set_epoch(self.data_cycle_seed)
 
         progress = None
         if self.accelerator.is_local_main_process:
@@ -314,90 +342,80 @@ class Trainer:
                 dynamic_ncols=True,
                 mininterval=0.5,
                 unit="update",
-                desc=f"epoch {start_epoch}",
+                desc="train",
             )
 
         try:
-            for epoch in range(start_epoch, self.epochs):
-                self.model.train()
+            self.model.train()
+            train_iterator = iter(train_dataloader)
 
-                # Set epoch for reproducible shuffling
-                if hasattr(train_dataloader, "batch_sampler") and hasattr(
-                    train_dataloader.batch_sampler, "set_epoch"
-                ):
-                    train_dataloader.batch_sampler.set_epoch(epoch)
-                if hasattr(train_dataloader, "dataset") and hasattr(train_dataloader.dataset, "set_epoch"):
-                    train_dataloader.dataset.set_epoch(epoch)
+            while self.max_steps <= 0 or global_update < self.max_steps:
+                try:
+                    batch = next(train_iterator)
+                except StopIteration:
+                    train_iterator = iter(train_dataloader)
+                    continue
 
-                if progress is not None:
-                    progress.set_description(f"epoch {epoch}")
+                with self.accelerator.accumulate(self.model):
+                    loss, _, _ = self.model(
+                        inp=batch["specs"],
+                        text=batch["texts"],
+                        lens=batch["lengths"],
+                    )
+                    self.accelerator.backward(loss)
 
-                for batch in train_dataloader:
-                    with self.accelerator.accumulate(self.model):
-                        loss, _, _ = self.model(
-                            inp=batch["specs"],
-                            text=batch["texts"],
-                            lens=batch["lengths"],
+                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+
+                if self.accelerator.sync_gradients:
+                    if self.ema_model is not None:
+                        self.ema_model.update()
+                    global_update += 1
+
+                    if progress is not None:
+                        progress.update(1)
+                        progress.set_postfix(
+                            update=str(global_update),
+                            loss=f"{loss.item():.4f}",
                         )
-                        self.accelerator.backward(loss)
 
-                        if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                # TensorBoard logging
+                if (
+                    self.accelerator.is_local_main_process
+                    and self.writer is not None
+                    and self.log_every_steps > 0
+                    and global_update % self.log_every_steps == 0
+                ):
+                    self.writer.add_scalar("train/loss", loss.item(), global_update)
+                    self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], global_update)
 
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
+                # Update model_last.pt periodically
+                if (
+                    self.last_per_updates > 0
+                    and global_update % self.last_per_updates == 0
+                    and self.accelerator.sync_gradients
+                ):
+                    self.save_checkpoint(global_update, last=True)
 
-                    if self.accelerator.sync_gradients:
-                        if self.ema_model is not None:
-                            self.ema_model.update()
-                        global_update += 1
+                # Save full checkpoint folder periodically
+                if (
+                    self.save_per_updates > 0
+                    and global_update % self.save_per_updates == 0
+                    and self.accelerator.sync_gradients
+                ):
+                    self.save_checkpoint(global_update)
 
-                        if progress is not None:
-                            progress.update(1)
-                            progress.set_postfix(
-                                update=str(global_update),
-                                loss=f"{loss.item():.4f}",
-                            )
+                    sample_paths = self._save_sample_outputs(batch, global_update)
+                    if sample_paths:
+                        print(f"[samples] update={global_update} saved {' '.join(sample_paths)}")
+                    self.accelerator.wait_for_everyone()
 
-                    # TensorBoard logging
-                    if (
-                        self.accelerator.is_local_main_process
-                        and self.writer is not None
-                        and self.log_every_steps > 0
-                        and global_update % self.log_every_steps == 0
-                    ):
-                        self.writer.add_scalar("train/loss", loss.item(), global_update)
-                        self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], global_update)
-
-                    # Update model_last.pt periodically
-                    if (
-                        self.last_per_updates > 0
-                        and global_update % self.last_per_updates == 0
-                        and self.accelerator.sync_gradients
-                    ):
-                        self.save_checkpoint(global_update, epoch=epoch, last=True)
-
-                    # Save full checkpoint folder periodically
-                    if (
-                        self.save_per_updates > 0
-                        and global_update % self.save_per_updates == 0
-                        and self.accelerator.sync_gradients
-                    ):
-                        self.save_checkpoint(global_update, epoch=epoch)
-
-                        sample_paths = self._save_sample_outputs(batch, global_update)
-                        if sample_paths:
-                            print(f"[samples] update={global_update} saved {' '.join(sample_paths)}")
-
-                    if self.max_steps > 0 and global_update >= self.max_steps:
-                        break
-
-                # Save end-of-epoch last checkpoint
-                self.save_checkpoint(global_update, epoch=epoch + 1, last=True)
-
-                if self.max_steps > 0 and global_update >= self.max_steps:
-                    break
+            if global_update > start_update:
+                self.save_checkpoint(global_update, last=True)
 
         finally:
             if progress is not None:

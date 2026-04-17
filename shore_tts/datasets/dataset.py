@@ -86,6 +86,7 @@ class ShoreDataset(IterableDataset):
         mdct = cfg.get("mdct_params", {})
 
         self.sample_rate = sample_rate or cfg.get("sample_rate", 22050)
+        self.hop_length = int(hop_length or mdct.get("hop_length", 1024))
         self.min_length = min_length
         self.max_length = max_length
         self.batch_size = batch_size
@@ -97,7 +98,7 @@ class ShoreDataset(IterableDataset):
         self.tar_files = _discover_tar_files(data_path)
 
         self.mdct = BN_MDCT_Spectrogram(
-            hop_length=hop_length or mdct.get("hop_length", 1024),
+            hop_length=self.hop_length,
             n_bands=n_bands or mdct.get("n_bands", 20),
         )
         self.mdct.eval()
@@ -105,53 +106,18 @@ class ShoreDataset(IterableDataset):
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
 
-    @staticmethod
-    def _extract_text(sample: dict) -> Optional[str]:
-        """兼容 .txt 与 .json（Emilia）标注，提取 text 字段。"""
-        if "txt" in sample:
-            raw = sample["txt"]
-            return raw.decode("utf-8").strip() if isinstance(raw, bytes) else str(raw).strip()
-        if "json" in sample:
-            raw = sample["json"]
-            try:
-                meta = json.loads(raw) if isinstance(raw, (bytes, str)) else raw if isinstance(raw, dict) else None
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return None
-            return (meta.get("text") or "").strip() or None if meta else None
-        return None
-
-    def _decode_sample(self, sample: dict) -> Optional[dict]:
-        """解析 + 解码 + MDCT + 帧长过滤，返回 {"spec": (T,F), "text": str} 或 None。"""
-        audio_bytes = next((sample[k] for k in _AUDIO_KEYS if k in sample), None)
-        if audio_bytes is None:
-            return None
-        text = self._extract_text(sample)
-        if not text:
-            return None
-
-        try:
-            waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
-        except Exception:
-            return None
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        if sr != self.sample_rate:
-            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
-
-        with torch.no_grad():
-            spec = self.mdct(waveform).squeeze(0)  # (T, F)
-        if not (self.min_length <= spec.shape[0] <= self.max_length):
-            return None
-        return {"spec": spec, "text": text}
-
-    def __iter__(self):
+    def _assigned_tar_files_for_cycle(self, cycle: int) -> List[str]:
         tar_files = list(self.tar_files)
         if self.epoch_shuffle:
-            random.Random(self._epoch).shuffle(tar_files)
+            random.Random(cycle).shuffle(tar_files)
 
-        if self.world_size > 1:
-            tar_files = _assign_tar_files_by_size(tar_files, self.world_size)[self.rank]
+        if self.world_size <= 1:
+            return tar_files
 
+        assignments = _assign_tar_files_by_size(tar_files, self.world_size)
+        return assignments[(self.rank + cycle) % self.world_size]
+
+    def _iter_cycle_batches(self, tar_files: List[str]):
         if not tar_files:
             return
 
@@ -171,9 +137,60 @@ class ShoreDataset(IterableDataset):
                 yield _collate_batch(buf)
                 buf = []
 
-        # 收尾：不足一个 batch 的剩余样本也 yield
         if buf:
             yield _collate_batch(buf)
+
+    @staticmethod
+    def _extract_text(sample: dict) -> Optional[str]:
+        """兼容 .txt 与 .json（Emilia）标注，提取 text 字段。"""
+        if "txt" in sample:
+            raw = sample["txt"]
+            return raw.decode("utf-8").strip() if isinstance(raw, bytes) else str(raw).strip()
+        if "json" in sample:
+            raw = sample["json"]
+            try:
+                meta = json.loads(raw) if isinstance(raw, (bytes, str)) else raw if isinstance(raw, dict) else None
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return None
+            return (meta.get("text") or "").strip() or None if meta else None
+        return None
+
+    def _estimate_frame_length(self, waveform: torch.Tensor) -> int:
+        """按 sample_rate / hop_length 估算 MDCT 帧数；24000 / 100 = 240 frame/s。"""
+        return waveform.shape[-1] // self.hop_length
+
+    def _decode_sample(self, sample: dict) -> Optional[dict]:
+        """解析 + 解码 + 帧长预过滤 + MDCT，返回 {"spec": (T,F), "text": str} 或 None。"""
+        audio_bytes = next((sample[k] for k in _AUDIO_KEYS if k in sample), None)
+        if audio_bytes is None:
+            return None
+        text = self._extract_text(sample)
+        if not text:
+            return None
+
+        try:
+            waveform, sr = torchaudio.load(io.BytesIO(audio_bytes))
+        except Exception:
+            return None
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
+
+        frame_length = self._estimate_frame_length(waveform)
+        if not (self.min_length <= frame_length <= self.max_length):
+            return None
+
+        with torch.no_grad():
+            spec = self.mdct(waveform).squeeze(0)  # (T, F)
+        return {"spec": spec, "text": text}
+
+    def __iter__(self):
+        cycle = self._epoch
+        while True:
+            tar_files = self._assigned_tar_files_for_cycle(cycle)
+            yield from self._iter_cycle_batches(tar_files)
+            cycle += 1
 
 
 def collate_fn(batch):
