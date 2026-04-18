@@ -37,19 +37,24 @@ from shore_tts.text.tokenizer import PinyinTokenizer
 
 
 def locate_checkpoint_files(checkpoint_dir: str | Path) -> tuple[Path, Path, Path]:
-    """Locate config.json, vocab.json, and model.pth inside *checkpoint_dir*.
+    """Locate config.json, vocab.json, and a model weight file inside *checkpoint_dir*.
 
-    Looks directly inside the directory first, then one level deep for
-    sub-directories that contain the expected files.
+    Accepts both ``model.pth`` (extracted weights) and ``model.pt`` (training
+    checkpoint).  Looks directly inside the directory first, then one level
+    deep for sub-directories that contain the expected files.
     """
     checkpoint_dir = Path(checkpoint_dir)
 
     def _find(base: Path) -> tuple[Path, Path, Path] | None:
         config = base / "config.json"
         vocab = base / "vocab.json"
-        model = base / "model.pth"
-        if config.is_file() and vocab.is_file() and model.is_file():
-            return config, vocab, model
+        if not (config.is_file() and vocab.is_file()):
+            return None
+        # Prefer model.pth (pre-extracted) over model.pt (training checkpoint)
+        for name in ("model.pth", "model.pt"):
+            model = base / name
+            if model.is_file():
+                return config, vocab, model
         return None
 
     result = _find(checkpoint_dir)
@@ -64,7 +69,7 @@ def locate_checkpoint_files(checkpoint_dir: str | Path) -> tuple[Path, Path, Pat
                 return result
 
     raise FileNotFoundError(
-        f"Could not find config.json, vocab.json, and model.pth in {checkpoint_dir}"
+        f"Could not find config.json, vocab.json, and model weight file in {checkpoint_dir}"
     )
 
 
@@ -134,7 +139,27 @@ def load_model(
     model = CFM(transformer=transformer, **cfm_cfg)
 
     # ---- Load weights ----
-    state_dict = torch.load(str(model_path), map_location=device, weights_only=False)
+    raw = torch.load(str(model_path), map_location=device, weights_only=False)
+
+    if isinstance(raw, dict) and "model_state_dict" in raw:
+        # Training checkpoint (.pt) — extract EMA weights if available
+        if "ema_model_state_dict" in raw:
+            ema_raw = raw["ema_model_state_dict"]
+            state_dict = {
+                k.replace("ema_model.", "", 1): v
+                for k, v in ema_raw.items()
+                if k.startswith("ema_model.")
+            }
+            print("[info] Loaded EMA weights from training checkpoint.")
+        else:
+            state_dict = raw["model_state_dict"]
+            print("[warning] EMA weights not found, using online model weights. "
+                  "Quality may be significantly worse than training samples.")
+    else:
+        # Pre-extracted state dict (.pth)
+        state_dict = raw
+        print("[info] Loaded pre-extracted model weights.")
+
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
@@ -155,6 +180,7 @@ def infer(
     max_duration: int = 65536,
     speed: float = 1.0,
     fix_duration: float | None = None,
+    duration_factor: float | None = None,
     device: torch.device = torch.device("cpu"),
 ) -> tuple[torch.Tensor, int]:
     """Run inference and return (waveform, sample_rate).
@@ -166,6 +192,9 @@ def infer(
             audio, lower values produce slower (longer) audio. Default 1.0.
         fix_duration: If set, force the total output duration (ref + gen) to
             this value in seconds. Overrides the proportional duration estimate.
+        duration_factor: If set (and fix_duration is None), total duration is
+            ``ref_len * duration_factor``. Matches the training sampling default
+            of 2.0.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -199,6 +228,8 @@ def infer(
     # ---- Estimate duration ----
     if fix_duration is not None:
         duration = int(fix_duration * target_sr / hop_length)
+    elif duration_factor is not None:
+        duration = int(ref_len * duration_factor)
     else:
         # Proportional estimation inspired by F5-TTS:
         # ref_frames / ref_text_bytes gives "frames per text byte" from the
@@ -218,18 +249,20 @@ def infer(
     # Ensure at least one frame beyond the reference
     duration = max(duration, ref_len + 1)
 
-    # ---- Sample ----
-    generated, _ = model.sample(
-        cond=ref_spec[:, :ref_len],
-        text=[full_text],
-        duration=duration,
-        steps=steps,
-        cfg_strength=cfg_strength,
-        sway_sampling_coef=sway_sampling_coef,
-        seed=seed,
-        max_duration=max_duration,
-        lens=torch.tensor([ref_len], device=device, dtype=torch.long),
-    )
+    # ---- Sample with autocast to match training fp16 behavior ----
+    autocast_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+        generated, _ = model.sample(
+            cond=ref_spec[:, :ref_len],
+            text=[full_text],
+            duration=duration,
+            steps=steps,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
+            seed=seed,
+            max_duration=max_duration,
+            lens=torch.tensor([ref_len], device=device, dtype=torch.long),
+        )
 
     # Slice off the reference portion to get only generated audio
     generated = generated[:, ref_len:, :]
@@ -258,13 +291,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ref_audio",
         type=str,
-        default=None,
+        default='./assets/test.wav',
         help="Path to reference audio for voice cloning (optional).",
     )
     parser.add_argument(
         "--ref_text",
         type=str,
-        default=None,
+        default="你们有人想做我的颜料吗",
         help="Transcript of the reference audio (required if --ref_audio is provided).",
     )
     parser.add_argument(
@@ -276,8 +309,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--steps",
         type=int,
-        default=32,
-        help="Number of ODE solver steps (default: 32).",
+        default=16,
+        help="Number of ODE solver steps (default: 16, matches training).",
     )
     parser.add_argument(
         "--cfg_strength",
@@ -315,6 +348,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Fix total output duration in seconds (overrides proportional estimate).",
     )
+    parser.add_argument(
+        "--duration_factor",
+        type=float,
+        default=2.0,
+        help="Total duration = ref_len * factor. Matches training default of 2.0.",
+    )
     return parser.parse_args()
 
 
@@ -341,6 +380,7 @@ def main() -> None:
         seed=args.seed,
         speed=args.speed,
         fix_duration=args.fix_duration,
+        duration_factor=args.duration_factor,
         device=device,
     )
 

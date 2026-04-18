@@ -90,6 +90,7 @@ def build_optimizer(config: dict[str, Any], model: torch.nn.Module):
     weight_decay = float(optim_cfg.get("weight_decay", 0.0))
 
     if optimizer_type == "adamw":
+        print("Using AdamW Optimizer...")
         fused = bool(optim_cfg.get("fused", True)) and torch.cuda.is_available()
         return AdamW(
             model.parameters(),
@@ -99,6 +100,7 @@ def build_optimizer(config: dict[str, Any], model: torch.nn.Module):
             fused=fused,
         )
     elif optimizer_type == "muon_adamw":
+        print("Using Muon Optimizer...")
         muon_args = optim_cfg.get("muon_args", {})
         adamw_args = optim_cfg.get("adamw_args", {})
         return Muon_AdamW(
@@ -109,7 +111,7 @@ def build_optimizer(config: dict[str, Any], model: torch.nn.Module):
             adamw_args=adamw_args,
         )
     else:
-        raise ValueError(f"Unknown optimizer_type: {optimizer_type!r}")
+        raise ValueError(f"Unknown optimizer_type: {optimizer_type!r}, please choose one of [muon_adamw] and [adamw]")
 
 
 def build_scheduler(config: dict[str, Any], optimizer, num_processes: int = 1):

@@ -73,9 +73,10 @@ class Trainer:
         self.model, self.optimizer = self.accelerator.prepare(model, self.optimizer)
 
         # EMA on main process only (after prepare so model is on correct device)
+        # Keep EMA in fp32 to avoid precision loss in bf16 mixed-precision training
         if self.is_main:
             self.ema_model = EMA(self.accelerator.unwrap_model(self.model), include_online_model=False)
-            self.ema_model.to(self.accelerator.device)
+            self.ema_model.to(self.accelerator.device, dtype=torch.float32)
         else:
             self.ema_model = None
 
@@ -269,7 +270,7 @@ class Trainer:
         original_state = None
         if self.ema_model is not None:
             original_state = {k: v.detach().clone() for k, v in raw_model.state_dict().items()}
-            self.ema_model.copy_to(raw_model)
+            self.ema_model.copy_params_from_ema_to_model()
 
         was_training = raw_model.training
         raw_model.eval()

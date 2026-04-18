@@ -213,3 +213,4 @@ checkpoints/
 *.wav
 *.npy
 .claude
+wvmos/

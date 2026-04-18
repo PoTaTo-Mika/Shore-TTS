@@ -6,7 +6,7 @@
     "num_workers": 16,
     "min_length": 100,
     "max_length": 6000,
-    "batch_size": 16,
+    "batch_size": 32,
     "epoch_shuffle": true
   },
   "text": {
@@ -30,7 +30,7 @@
       "attn_backend": "flash_attn",
       "attn_mask_enabled": true,
       "long_skip_connection": false,
-      "checkpoint_activations": false
+      "checkpoint_activations": true
     },
     "cfm": {
       "sigma": 0.0,
@@ -43,14 +43,9 @@
     }
   },
   "optim": {
-    "optimizer_type": "adamw",
-    "lr": 7.5e-5,
-    "betas": [
-      0.9,
-      0.95
-    ],
-    "fused": true,
-    "weight_decay": 0.00,
+    "optimizer_type": "muon_adamw",
+    "lr": 1e-4,
+    "weight_decay": 0.05,
     "grad_clip": 1.0,
     "muon_args": {
       "momentum": 0.95,
