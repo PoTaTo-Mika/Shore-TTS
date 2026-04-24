@@ -10,7 +10,7 @@
     "epoch_shuffle": true
   },
   "text": {
-    "tokenizer_path": "checkpoints/Shore-TTS-0.1/vocab.json",
+    "tokenizer_path": "checkpoints/vocab.json",
     "polyphone": true
   },
   "model": {
