@@ -249,8 +249,8 @@ def infer(
     # Ensure at least one frame beyond the reference
     duration = max(duration, ref_len + 1)
 
-    # ---- Sample with autocast to match training fp16 behavior ----
-    autocast_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    # ---- Sample with autocast to match training bf16 behavior ----
+    autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     with torch.autocast(device_type=device.type, dtype=autocast_dtype):
         generated, _ = model.sample(
             cond=ref_spec[:, :ref_len],

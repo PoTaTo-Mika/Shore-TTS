@@ -36,7 +36,7 @@ class Trainer:
 
         # Accelerator
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        precision = str(train_cfg.get("precision", "fp16")).lower()
+        precision = str(train_cfg.get("precision", "bf16")).lower()
         mp_map = {"fp32": "no", "fp16": "fp16", "bf16": "bf16"}
         mixed_precision = mp_map.get(precision, "no")
         grad_accum = int(train_cfg.get("grad_accumulation_steps", 1))
