@@ -213,3 +213,4 @@ F5-TTS/
 *.npy
 .claude
 wvmos/
+checkpoints/

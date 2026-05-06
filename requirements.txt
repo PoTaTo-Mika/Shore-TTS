@@ -1,0 +1,13 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+torchcodec
+torchdiffeq
+einops
+ema_pytorch>=0.5.2
+accelerate>=0.33.0
+numpy
+webdataset
+tqdm>=4.65.0
+pypinyin
+rjieba
+safetensors
