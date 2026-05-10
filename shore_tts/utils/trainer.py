@@ -80,13 +80,9 @@ class Trainer:
         else:
             self.ema_model = None
 
-        # TensorBoard writer
+        # TensorBoard config (writer created lazily in train() so we know resume step)
+        self._tb_cfg = train_cfg.get("tensorboard", {})
         self.writer = None
-        if self.is_main:
-            tb_cfg = train_cfg.get("tensorboard", {})
-            if tb_cfg.get("enabled", True):
-                log_dir = tb_cfg.get("log_dir", os.path.join(self.checkpoint_path, "tensorboard"))
-                self.writer = SummaryWriter(log_dir=log_dir)
 
         if self.is_main:
             raw_model = self.accelerator.unwrap_model(self.model)
@@ -330,6 +326,12 @@ class Trainer:
         start_update = self.load_checkpoint()
         global_update = start_update
 
+        # Create TensorBoard writer (after checkpoint load so we know the resume step)
+        if self.is_main and self._tb_cfg.get("enabled", True):
+            log_dir = self._tb_cfg.get("log_dir", os.path.join(self.checkpoint_path, "tensorboard"))
+            purge_step = start_update if start_update > 0 else None
+            self.writer = SummaryWriter(log_dir=log_dir, purge_step=purge_step)
+
         self.data_cycle_seed = self._resolve_data_seed(start_update)
         if hasattr(train_dataloader, "dataset") and hasattr(train_dataloader.dataset, "set_epoch"):
             train_dataloader.dataset.set_epoch(self.data_cycle_seed)
@@ -358,15 +360,19 @@ class Trainer:
                     continue
 
                 with self.accelerator.accumulate(self.model):
-                    loss, _, _ = self.model(
+                    loss, _, _, loss_low, loss_high = self.model(
                         inp=batch["specs"],
                         text=batch["texts"],
                         lens=batch["lengths"],
                     )
                     self.accelerator.backward(loss)
 
-                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    grad_norm = 0.0
+                    if self.accelerator.sync_gradients:
+                        grad_norm = self.accelerator.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.max_grad_norm if self.max_grad_norm > 0 else float("inf"),
+                        ).item()
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -392,6 +398,9 @@ class Trainer:
                     and global_update % self.log_every_steps == 0
                 ):
                     self.writer.add_scalar("train/loss", loss.item(), global_update)
+                    self.writer.add_scalar("train/loss_low_freq", loss_low.item(), global_update)
+                    self.writer.add_scalar("train/loss_high_freq", loss_high.item(), global_update)
+                    self.writer.add_scalar("train/grad_norm", grad_norm, global_update)
                     self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], global_update)
 
                 # Update model_last.pt periodically

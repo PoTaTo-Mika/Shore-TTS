@@ -305,4 +305,14 @@ class CFM(nn.Module):
         # flow matching loss (frequency-weighted)
         loss = self.loss_fn(pred, flow, mask=rand_span_mask)
 
-        return loss, cond, pred
+        # split loss by frequency: first half = low freq, second half = high freq
+        D = pred.shape[-1]
+        half = D // 2
+        if rand_span_mask is not None:
+            loss_low = (pred[..., :half] - flow[..., :half]).pow(2)[rand_span_mask].mean()
+            loss_high = (pred[..., half:] - flow[..., half:]).pow(2)[rand_span_mask].mean()
+        else:
+            loss_low = (pred[..., :half] - flow[..., :half]).pow(2).mean()
+            loss_high = (pred[..., half:] - flow[..., half:]).pow(2).mean()
+
+        return loss, cond, pred, loss_low, loss_high
