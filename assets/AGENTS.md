@@ -2,6 +2,8 @@
 
 非自回归 TTS：BN-MDCT 特征 + CFM + DiT。无 vocoder/codec，网络直接预测 BN-MDCT 谱（可由信号处理算法无损还原波形）。
 
+你可以根据这个markdown获取大部分信息，如果还有不懂的可以查阅更加详细的Human documents.
+
 ## 关键路径
 
 | 用途 | 文件 |
