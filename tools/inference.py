@@ -13,6 +13,8 @@ import torchaudio
 
 from shore_tts.models.cfm import CFM
 from shore_tts.models.dit import DiT
+from shore_tts.text.clean import clean_text
+from shore_tts.text.split import split_text
 from shore_tts.text.tokenizer import PinyinTokenizer
 
 
@@ -118,10 +120,16 @@ def infer(
     speed: float = 1.0,
     fix_duration: float | None = None,
     duration_factor: float | None = None,
+    max_text_length: int | None = None,
     device: torch.device = torch.device("cpu"),
 ) -> tuple[torch.Tensor, int]:
     if seed is not None:
         torch.manual_seed(seed)
+
+    # Clean text
+    text = clean_text(text)
+    if ref_text:
+        ref_text = clean_text(ref_text)
 
     target_sr = model.spec.target_sample_rate
     hop_length = model.spec.hop_length
@@ -137,46 +145,61 @@ def infer(
     else:
         ref_waveform = torch.zeros(1, target_sr, device=device)
 
-    full_text = f"{ref_text} {text}" if (ref_text and ref_audio) else text
-
     ref_spec = model.spec(ref_waveform).permute(0, 2, 1)  # (1, T, F)
     ref_len = ref_spec.shape[1]
 
-    # Duration estimation
-    if fix_duration is not None:
-        duration = int(fix_duration * target_sr / hop_length)
-    elif duration_factor is not None:
-        duration = int(ref_len * duration_factor)
+    # Split text into segments if max_text_length is set
+    if max_text_length is not None:
+        segments = split_text(text, max_text_length)
+        if not segments:
+            return torch.zeros(1, target_sr), target_sr
     else:
-        ref_text_len = len(ref_text.encode("utf-8")) if ref_text else 0
-        gen_text_len = len(text.encode("utf-8"))
-        if ref_text_len > 0 and ref_audio is not None:
-            gen_frames = int(ref_len / ref_text_len * gen_text_len / speed)
-        else:
-            text_tokens = model.tokenize_text([full_text], device)
-            n_tokens = int((text_tokens != -1).sum(dim=-1).item())
-            gen_frames = int(n_tokens * 6 / speed)
-        duration = ref_len + gen_frames
-
-    duration = max(duration, ref_len + 1)
+        segments = [text]
 
     autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-        generated, _ = model.sample(
-            cond=ref_spec[:, :ref_len],
-            text=[full_text],
-            duration=duration,
-            steps=steps,
-            cfg_strength=cfg_strength,
-            sway_sampling_coef=sway_sampling_coef,
-            seed=seed,
-            max_duration=max_duration,
-            lens=torch.tensor([ref_len], device=device, dtype=torch.long),
-        )
+    wavs: list[torch.Tensor] = []
 
-    generated = generated[:, ref_len:, :]
-    wav = model.spec.inverse(generated.permute(0, 2, 1), length=generated.shape[1] * hop_length).cpu()
-    return wav, target_sr
+    for seg in segments:
+        full_text = f"{ref_text} {seg}" if (ref_text and ref_audio) else seg
+
+        # Duration estimation
+        if fix_duration is not None:
+            duration = int(fix_duration * target_sr / hop_length)
+        elif duration_factor is not None:
+            duration = int(ref_len * duration_factor)
+        else:
+            ref_text_len = len(ref_text.encode("utf-8")) if ref_text else 0
+            gen_text_len = len(seg.encode("utf-8"))
+            if ref_text_len > 0 and ref_audio is not None:
+                gen_frames = int(ref_len / ref_text_len * gen_text_len / speed)
+            else:
+                text_tokens = model.tokenize_text([full_text], device)
+                n_tokens = int((text_tokens != -1).sum(dim=-1).item())
+                gen_frames = int(n_tokens * 6 / speed)
+            duration = ref_len + gen_frames
+
+        duration = max(duration, ref_len + 1)
+
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+            generated, _ = model.sample(
+                cond=ref_spec[:, :ref_len],
+                text=[full_text],
+                duration=duration,
+                steps=steps,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                seed=seed,
+                max_duration=max_duration,
+                lens=torch.tensor([ref_len], device=device, dtype=torch.long),
+            )
+
+        generated = generated[:, ref_len:, :]
+        wav = model.spec.inverse(generated.permute(0, 2, 1), length=generated.shape[1] * hop_length).cpu()
+        wavs.append(wav)
+
+    if len(wavs) == 1:
+        return wavs[0], target_sr
+    return torch.cat(wavs, dim=1), target_sr
 
 
 def main() -> None:
@@ -194,6 +217,7 @@ def main() -> None:
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--fix_duration", type=float, default=None)
     p.add_argument("--duration_factor", type=float, default=2.0)
+    p.add_argument("--max_text_length", type=int, default=None, help="Max UTF-8 byte length per segment; splits long text automatically")
     args = p.parse_args()
 
     device = torch.device(args.device) if args.device else (
@@ -209,7 +233,7 @@ def main() -> None:
         model=model, text=args.text, ref_audio=args.ref_audio, ref_text=args.ref_text,
         steps=args.steps, cfg_strength=args.cfg_strength, sway_sampling_coef=args.sway_sampling_coef,
         seed=args.seed, speed=args.speed, fix_duration=args.fix_duration,
-        duration_factor=args.duration_factor, device=device,
+        duration_factor=args.duration_factor, max_text_length=args.max_text_length, device=device,
     )
 
     out = Path(args.output)
