@@ -35,7 +35,7 @@ class TextEmbedding(nn.Module):
 
         if conv_layers > 0:
             self.extra_modeling = True
-            self.precompute_max_pos = 8192  # 8192 is ~87.38s of 24khz audio; 4096 is ~43.69s of 24khz audio
+            self.precompute_max_pos = 8192  # 8192 is about 33s of MDCT based audio.
             self.register_buffer("freqs_cis", precompute_freqs_cis(text_dim, self.precompute_max_pos), persistent=False)
             self.text_blocks = nn.Sequential(
                 *[ConvNeXtV2Block(text_dim, text_dim * conv_mult) for _ in range(conv_layers)]
