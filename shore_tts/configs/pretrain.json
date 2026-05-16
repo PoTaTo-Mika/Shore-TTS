@@ -1,7 +1,7 @@
 {
   "seed": 42,
   "data": {
-    "data_path": "/root/Emilia/Emilia",
+    "data_path": "/root/Audio-Data/",
     "mdct_config": "shore_tts/configs/mdct.json",
     "num_workers": 16,
     "min_length": 100,

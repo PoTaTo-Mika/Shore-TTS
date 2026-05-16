@@ -119,7 +119,6 @@ def infer(
     max_duration: int = 65536,
     speed: float = 1.0,
     fix_duration: float | None = None,
-    duration_factor: float | None = None,
     max_text_length: int | None = None,
     device: torch.device = torch.device("cpu"),
 ) -> tuple[torch.Tensor, int]:
@@ -165,18 +164,20 @@ def infer(
         # Duration estimation
         if fix_duration is not None:
             duration = int(fix_duration * target_sr / hop_length)
-        elif duration_factor is not None:
-            duration = int(ref_len * duration_factor)
         else:
-            ref_text_len = len(ref_text.encode("utf-8")) if ref_text else 0
-            gen_text_len = len(seg.encode("utf-8"))
-            if ref_text_len > 0 and ref_audio is not None:
-                gen_frames = int(ref_len / ref_text_len * gen_text_len / speed)
+            ref_duration_sec = ref_len * hop_length / target_sr
+            ref_char_count = len(ref_text) if ref_text else 0
+            gen_char_count = len(seg)
+
+            if ref_char_count > 0 and ref_audio is not None:
+                sec_per_char = ref_duration_sec / ref_char_count
+                gen_duration_sec = gen_char_count * sec_per_char / speed
+                duration = int(gen_duration_sec * target_sr / hop_length) + ref_len
             else:
                 text_tokens = model.tokenize_text([full_text], device)
                 n_tokens = int((text_tokens != -1).sum(dim=-1).item())
                 gen_frames = int(n_tokens * 6 / speed)
-            duration = ref_len + gen_frames
+                duration = ref_len + gen_frames
 
         duration = max(duration, ref_len + 1)
 
@@ -216,7 +217,6 @@ def main() -> None:
     p.add_argument("--device", default=None)
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--fix_duration", type=float, default=None)
-    p.add_argument("--duration_factor", type=float, default=2.0)
     p.add_argument("--max_text_length", type=int, default=None, help="Max UTF-8 byte length per segment; splits long text automatically")
     args = p.parse_args()
 
@@ -233,7 +233,7 @@ def main() -> None:
         model=model, text=args.text, ref_audio=args.ref_audio, ref_text=args.ref_text,
         steps=args.steps, cfg_strength=args.cfg_strength, sway_sampling_coef=args.sway_sampling_coef,
         seed=args.seed, speed=args.speed, fix_duration=args.fix_duration,
-        duration_factor=args.duration_factor, max_text_length=args.max_text_length, device=device,
+        max_text_length=args.max_text_length, device=device,
     )
 
     out = Path(args.output)
