@@ -11,3 +11,6 @@ tqdm>=4.65.0
 pypinyin
 rjieba
 safetensors
+tensorboard
+transformers
+soundfile
