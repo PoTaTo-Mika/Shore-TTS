@@ -6,6 +6,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import Any
+import signal
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -348,11 +349,25 @@ class Trainer:
                 desc="train",
             )
 
+        stop_requested = False
+
+        def _handle_sigint(signum, frame):
+            nonlocal stop_requested
+            if stop_requested:
+                raise KeyboardInterrupt
+            stop_requested = True
+            if self.accelerator.is_local_main_process:
+                print("\n[SIGINT] Graceful stop requested. Press Ctrl+C again to force quit.", flush=True)
+
+        old_handler = signal.signal(signal.SIGINT, _handle_sigint)
+
         try:
             self.model.train()
             train_iterator = iter(train_dataloader)
 
             while self.max_steps <= 0 or global_update < self.max_steps:
+                if stop_requested:
+                    break
                 try:
                     batch = next(train_iterator)
                 except StopIteration:
@@ -428,6 +443,7 @@ class Trainer:
                 self.save_checkpoint(global_update, last=True)
 
         finally:
+            signal.signal(signal.SIGINT, old_handler)
             if progress is not None:
                 progress.close()
             if self.writer is not None:

@@ -110,6 +110,8 @@ def main():
     parser.add_argument("--task", type=str, default=None,
                         choices=list(TASK_FILES.values()),
                         help="Only process a specific task")
+    parser.add_argument("--output_dir", type=Path, default=None,
+                        help="Override output directory (default: eval_audio/seed_tts_eval)")
     args = parser.parse_args()
 
     if not args.folder.is_dir():
@@ -123,6 +125,8 @@ def main():
     model, sample_rate = load_model(args.checkpoint, device)
     print(f"Model loaded. sample_rate={sample_rate} device={device}")
 
+    output_root = args.output_dir if args.output_dir else OUTPUT_ROOT
+
     tasks = discover_tasks(args.folder)
     if not tasks:
         print("No task files found in the given folder.")
@@ -135,7 +139,7 @@ def main():
             continue
 
         entries = parse_meta(meta_path)
-        out_dir = OUTPUT_ROOT / lang / task_name
+        out_dir = output_root / lang / task_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n[{lang}/{task_name}] {len(entries)} samples -> {out_dir}")
