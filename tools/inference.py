@@ -11,8 +11,8 @@ os.environ["PROJECT_ROOT"] = os.path.abspath(os.path.join(os.path.dirname(__file
 import torch
 import torchaudio
 
-from shore_tts.models.cfm import CFM
-from shore_tts.models.dit import DiT
+from shore_tts.models.diffusion.cfm import CFM
+from shore_tts.models.diffusion.dit import DiT
 from shore_tts.text.clean import clean_text
 from shore_tts.text.split import split_text
 from shore_tts.text.tokenizer import PinyinTokenizer

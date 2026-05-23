@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from shore_tts.models.modules import (
+from shore_tts.models.diffusion.modules import (
     AdaLayerNorm_Final,
     ConvNeXtV2Block,
     ConvPositionEmbedding,

@@ -13,8 +13,8 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from accelerate import Accelerator
 
 from shore_tts.datasets.dataset import build_dataloader
-from shore_tts.models.cfm import CFM
-from shore_tts.models.dit import DiT
+from shore_tts.models.diffusion.cfm import CFM
+from shore_tts.models.diffusion.dit import DiT
 from shore_tts.optimizer.muon import Muon_AdamW
 from shore_tts.text.tokenizer import PinyinTokenizer
 

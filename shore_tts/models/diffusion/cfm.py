@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
 
-from shore_tts.models.modules import MDCTSpec
+from shore_tts.models.diffusion.modules import MDCTSpec
 from shore_tts.utils.loss import FrequencyWeightedMSELoss
 from shore_tts.models.utils import (
     default,
