@@ -1,6 +1,8 @@
 # Shore-TTS: Vocoder is not all you need
 
-All rights reserved to [Fish Audio](https://fish.audio/)
+This is still an early demo of our work, we will push the model better and release relative technical report in the future.
+
+All rights reserved to [Fish Audio](https://fish.audio/).
 
 # Quick Start 
 
