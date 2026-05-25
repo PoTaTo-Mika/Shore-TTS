@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
+from tqdm import tqdm
 
 from shore_tts.models.diffusion.modules import MDCTSpec
 from shore_tts.utils.loss import FrequencyWeightedMSELoss
@@ -225,7 +226,16 @@ class CFM(nn.Module):
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
-        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        if self.odeint_kwargs.get("method") == "euler":
+            y = y0
+            trajectory = [y0] if t[0] == 0 else [y0]
+            t_steps = t[1:] - t[:-1]
+            for i in tqdm(range(len(t) - 1), desc="Sampling", unit="step"):
+                y = y + t_steps[i] * fn(t[i], y)
+                trajectory.append(y)
+            trajectory = torch.stack(trajectory)
+        else:
+            trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         self.transformer.clear_cache()
 
         sampled = trajectory[-1]
