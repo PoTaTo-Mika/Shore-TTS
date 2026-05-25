@@ -217,7 +217,7 @@ def main() -> None:
     p.add_argument("--device", default=None)
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--fix_duration", type=float, default=None)
-    p.add_argument("--max_text_length", type=int, default=None, help="Max UTF-8 byte length per segment; splits long text automatically")
+    p.add_argument("--max_text_length", type=int, default=200, help="Max UTF-8 byte length per segment; splits long text automatically")
     args = p.parse_args()
 
     device = torch.device(args.device) if args.device else (
