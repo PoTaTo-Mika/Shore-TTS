@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torchaudio
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -32,3 +31,26 @@ class FrequencyWeightedMSELoss(nn.Module):
         if mask is not None:
             loss = loss[mask]
         return loss.mean()
+
+class L2Loss(nn.Module):
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        loss = (pred - target).pow(2)
+
+        if mask is not None:
+            loss = loss[mask]
+        return loss.mean()
+
+
+class FeatureMatchingLoss(nn.Module):
+    """Feature matching loss that minimizes L1 distance between real and fake
+    intermediate discriminator feature maps.  `fmaps_real` and `fmaps_fake`
+    are flat lists of tensors gathered from every sub-discriminator layer.
+    """
+
+    def forward(self, fmaps_real: list[torch.Tensor], fmaps_fake: list[torch.Tensor]) -> torch.Tensor:
+        loss = 0.0
+        n = len(fmaps_real)
+        for fr, ff in zip(fmaps_real, fmaps_fake):
+            loss = loss + F.l1_loss(ff, fr.detach())
+        return loss / n
