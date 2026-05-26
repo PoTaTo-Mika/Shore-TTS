@@ -202,6 +202,102 @@ def infer(
         return wavs[0], target_sr
     return torch.cat(wavs, dim=1), target_sr
 
+@torch.no_grad()
+def parellel_infer(
+    model: CFM,
+    batch_inputs: list[list],
+    steps: int = 32,
+    cfg_strength: float = 1.0,
+    sway_sampling_coef: float | None = None,
+    seed: int | None = None,
+    max_length: int = 8192,
+    speed: float = 1.0,
+    fix_duration: float | None = None,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[list[torch.Tensor], int]:
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    texts, ref_audios, ref_texts = batch_inputs
+    batch_size = len(texts)
+    if not (len(ref_audios) == len(ref_texts) == batch_size):
+        raise ValueError(
+            f"All input lists must have the same length, "
+            f"got texts={batch_size}, ref_audios={len(ref_audios)}, ref_texts={len(ref_texts)}"
+        )
+
+    target_sr = model.spec.target_sample_rate
+    hop_length = model.spec.hop_length
+
+    ref_specs: list[torch.Tensor] = []
+    ref_lens: list[int] = []
+    for ref_audio in ref_audios:
+        if ref_audio is not None:
+            w, sr = torchaudio.load(str(ref_audio))
+            if sr != target_sr:
+                w = torchaudio.functional.resample(w, sr, target_sr)
+            if w.shape[0] > 1:
+                w = w.mean(dim=0, keepdim=True)
+            w = w.to(device)
+        else:
+            w = torch.zeros(1, target_sr, device=device)
+        spec = model.spec(w).permute(0, 2, 1)  # (1, T, F)
+        ref_specs.append(spec)
+        ref_lens.append(spec.shape[1])
+
+    max_ref_len = max(ref_lens)
+    padded: list[torch.Tensor] = []
+    for spec in ref_specs:
+        pad = max_ref_len - spec.shape[1]
+        if pad > 0:
+            p = torch.zeros(1, pad, spec.shape[2], device=device, dtype=spec.dtype)
+            spec = torch.cat([spec, p], dim=1)
+        padded.append(spec)
+    cond = torch.cat(padded, dim=0)  # (B, max_ref_len, F)
+
+    full_texts: list[str] = []
+    for text, ref_text in zip(texts, ref_texts):
+        t = clean_text(text)
+        if ref_text:
+            rt = clean_text(ref_text)
+            full_texts.append(f"{rt} {t}")
+        else:
+            full_texts.append(t)
+
+    if fix_duration is not None:
+        durations = [int(fix_duration * target_sr / hop_length) for _ in range(batch_size)]
+    else:
+        tokenized = model.tokenize_text(full_texts, device)
+        n_tokens = (tokenized != -1).sum(dim=-1)
+        gen_frames = (n_tokens * 6 / speed).long()
+        durations = (torch.tensor(ref_lens, device=device) + gen_frames).clamp(min=1).tolist()
+
+    durations = [max(d, rl + 1) for d, rl in zip(durations, ref_lens)]
+    duration_t = torch.tensor(durations, device=device, dtype=torch.long)
+
+    autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+        generated, _ = model.sample(
+            cond=cond,
+            text=full_texts,
+            duration=duration_t,
+            steps=steps,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
+            seed=seed,
+            max_duration=max_length,
+            lens=torch.tensor(ref_lens, device=device, dtype=torch.long),
+        )
+
+    wavs: list[torch.Tensor] = []
+    for i in range(batch_size):
+        gen = generated[i : i + 1, ref_lens[i] :, :]
+        wav = model.spec.inverse(gen.permute(0, 2, 1), length=gen.shape[1] * hop_length).cpu()
+        wavs.append(wav)
+
+    return wavs, target_sr
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Shore-TTS inference")
