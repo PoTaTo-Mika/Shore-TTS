@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
@@ -24,6 +25,7 @@ from shore_tts.utils.build import (
     build_train_dataloader,
     get_mdct_feature_config,
 )
+from shore_tts.utils.loss import L2Loss, FeatureMatchingLoss
 
 
 class Trainer:
@@ -438,6 +440,413 @@ class Trainer:
                     if sample_paths:
                         print(f"[samples] update={global_update} saved {' '.join(sample_paths)}")
                     self.accelerator.wait_for_everyone()
+
+            if global_update > start_update:
+                self.save_checkpoint(global_update, last=True)
+
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+            if progress is not None:
+                progress.close()
+            if self.writer is not None:
+                self.writer.close()
+            self.accelerator.end_training()
+
+class DiscriminatorTrainer(Trainer):
+    """GAN discriminator trainer that trains a waveform-domain discriminator against a frozen CFM generator.
+
+    The generator is loaded from a pre-trained checkpoint (EMA weights only) and kept frozen.
+    Only the discriminator is trained, using a combination of L2 adversarial loss and feature
+    matching loss.
+
+    Training follows the standard GAN pattern: text + voice reference → generate audio →
+    truncate both real and fake waveforms to the shorter length → D judges real vs fake.
+    """
+
+    def __init__(
+        self,
+        generator: torch.nn.Module,
+        discriminator: torch.nn.Module,
+        config: dict[str, Any],
+    ):
+        self.gen = generator
+        for p in self.gen.parameters():
+            p.requires_grad = False
+        self.gen.eval()
+
+        self.gen_steps = int(config.get("train", {}).get("gen_steps", 16))
+        self.gen_cfg_strength = float(config.get("train", {}).get("gen_cfg_strength", 1.0))
+        self.ref_ratio = float(config.get("train", {}).get("ref_ratio", 0.3))
+        self.fm_loss_weight = float(config.get("train", {}).get("fm_loss_weight", 1.0))
+        self.adv_loss_weight = float(config.get("train", {}).get("adv_loss_weight", 1.0))
+
+        # Use disc_optim section for the discriminator optimizer (fall back to optim)
+        disc_optim = config.get("disc_optim", dict(config["optim"]))
+        saved_optim = config["optim"]
+        config["optim"] = disc_optim
+        super().__init__(discriminator, config)
+        config["optim"] = saved_optim
+
+        # Move frozen generator to the accelerator device
+        self.gen = self.gen.to(self.accelerator.device)
+
+        if self.is_main:
+            d_total = sum(p.numel() for p in discriminator.parameters())
+            d_trainable = sum(p.numel() for p in discriminator.parameters() if p.requires_grad)
+            print(f"[discriminator] total_params={d_total:,} trainable_params={d_trainable:,}")
+
+    # ------------------------------------------------------------------
+    # Checkpoint: load generator EMA weights from a pre-trained CFM ckpt
+    # ------------------------------------------------------------------
+
+    def load_checkpoint(self) -> int:
+        resume_from = self.config["train"].get("resume_from")
+        if not resume_from or not os.path.exists(resume_from):
+            raise FileNotFoundError(
+                f"Generator checkpoint not found: {resume_from}. "
+                f"Set train.resume_from to a pre-trained CFM checkpoint directory."
+            )
+
+        self.accelerator.wait_for_everyone()
+
+        if os.path.isdir(resume_from):
+            model_path = os.path.join(resume_from, "model.pt")
+        else:
+            model_path = resume_from
+
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+
+        # Prefer EMA weights (better inference quality), but fall back to model_state_dict.
+        # EMA only tracks trainable parameters, not buffers like loss_fn.weights,
+        # so we must use strict=False when loading EMA.
+        ema_key = None
+        if "ema_model_state_dict" in checkpoint:
+            ema_key = "ema_model_state_dict"
+        elif "ema" in checkpoint:
+            ema_key = "ema"
+
+        if ema_key is not None:
+            state_dict = checkpoint[ema_key]
+            # Strip ema_model. prefix from EMA-tracked parameters
+            if any(k.startswith("ema_model.") for k in state_dict):
+                state_dict = {
+                    k.removeprefix("ema_model."): v
+                    for k, v in state_dict.items()
+                    if k.startswith("ema_model.")
+                }
+            missing, unexpected = self.gen.load_state_dict(state_dict, strict=False)
+            if self.is_main:
+                print(f"[disc_trainer] Loaded generator EMA weights from {resume_from}")
+                if missing:
+                    print(f"[disc_trainer] Missing keys (using fresh init): {missing}")
+                if unexpected:
+                    print(f"[disc_trainer] Unexpected keys (ignored): {unexpected}")
+        else:
+            if self.is_main:
+                print("[disc_trainer] WARNING: No EMA weights in checkpoint, loading model weights instead")
+            model_key = "model_state_dict" if "model_state_dict" in checkpoint else "model"
+            self.gen.load_state_dict(checkpoint[model_key], strict=True)
+
+        del checkpoint
+        gc.collect()
+
+        # ---- Resume discriminator training if a discriminator checkpoint is provided ----
+        disc_resume_from = self.config["train"].get("disc_resume_from")
+        if disc_resume_from and os.path.exists(disc_resume_from):
+            if os.path.isdir(disc_resume_from):
+                disc_model_path = os.path.join(disc_resume_from, "discriminator.pt")
+            else:
+                disc_model_path = disc_resume_from
+
+            disc_checkpoint = torch.load(disc_model_path, map_location="cpu", weights_only=True)
+
+            raw_disc = self.accelerator.unwrap_model(self.model)
+            raw_disc.load_state_dict(disc_checkpoint["discriminator_state_dict"])
+
+            if "optimizer_state_dict" in disc_checkpoint:
+                try:
+                    self.optimizer.load_state_dict(disc_checkpoint["optimizer_state_dict"])
+                except Exception:
+                    if self.is_main:
+                        print("[disc_resume] WARNING: Failed to load optimizer state (config may have changed). Using fresh optimizer.")
+            if "scheduler_state_dict" in disc_checkpoint:
+                try:
+                    self.scheduler.load_state_dict(disc_checkpoint["scheduler_state_dict"])
+                except Exception:
+                    if self.is_main:
+                        print("[disc_resume] WARNING: Failed to load scheduler state (config may have changed). Using fresh scheduler.")
+
+            update = int(disc_checkpoint.get("update", 0))
+            self.data_cycle_seed = int(disc_checkpoint.get("data_seed", update))
+
+            del disc_checkpoint
+            gc.collect()
+
+            if self.is_main:
+                print(f"[disc_resume] update={update} ckpt={disc_resume_from}")
+
+            return update
+
+        # Discriminator starts from step 0 — the generator's step is irrelevant here.
+        return 0
+
+    # ------------------------------------------------------------------
+    # Checkpoint: save discriminator-only weights
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, update: int, epoch: int = 0, last: bool = False) -> None:
+        self.accelerator.wait_for_everyone()
+        if self.is_main:
+            raw_disc = self.accelerator.unwrap_model(self.model)
+            state = {
+                "discriminator_state_dict": raw_disc.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "epoch": epoch,
+                "update": update,
+                "data_seed": self.data_cycle_seed,
+            }
+
+            Path(self.checkpoint_path).mkdir(parents=True, exist_ok=True)
+
+            if last:
+                self.accelerator.save(state, f"{self.checkpoint_path}/discriminator_last.pt")
+                print(f"Saved discriminator last checkpoint at update {update}")
+            else:
+                ckpt_dir = f"{self.checkpoint_path}/disc_step_{update:08d}"
+                Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+                self.accelerator.save(state, f"{ckpt_dir}/discriminator.pt")
+
+                config_path = os.path.join(ckpt_dir, "config.json")
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(self.config, f, indent=2, ensure_ascii=False)
+
+                print(f"[disc_checkpoint] update={update} saved to {ckpt_dir}/")
+
+                if self.keep_last_n_checkpoints > 0:
+                    self._rotate_disc_checkpoints()
+        self.accelerator.wait_for_everyone()
+
+    def _rotate_disc_checkpoints(self) -> None:
+        ckpt_dirs = sorted(
+            d for d in Path(self.checkpoint_path).iterdir()
+            if d.is_dir() and d.name.startswith("disc_step_")
+        )
+        while len(ckpt_dirs) > self.keep_last_n_checkpoints:
+            oldest = ckpt_dirs.pop(0)
+            shutil.rmtree(oldest)
+            print(f"Removed old discriminator checkpoint: {oldest.name}")
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
+    def train(self, train_dataloader=None) -> None:
+        if train_dataloader is None:
+            train_dataloader = build_train_dataloader(self.config, self.accelerator)
+
+        train_dataloader = self.accelerator.prepare(train_dataloader)
+
+        start_update = self.load_checkpoint()
+        global_update = start_update
+
+        # TensorBoard
+        if self.is_main and self._tb_cfg.get("enabled", True):
+            log_dir = self._tb_cfg.get(
+                "log_dir", os.path.join(self.checkpoint_path, "disc_tensorboard")
+            )
+            purge_step = start_update if start_update > 0 else None
+            self.writer = SummaryWriter(log_dir=log_dir, purge_step=purge_step)
+
+        # Progress bar
+        progress = None
+        if self.accelerator.is_local_main_process:
+            total = self.max_steps if self.max_steps > 0 else None
+            progress = tqdm(
+                total=total,
+                initial=global_update,
+                dynamic_ncols=True,
+                mininterval=0.5,
+                unit="update",
+                desc="disc_train",
+            )
+
+        adv_loss_fn = L2Loss()
+        fm_loss_fn = FeatureMatchingLoss()
+
+        self.model.train()
+        train_iterator = iter(train_dataloader)
+
+        stop_requested = False
+
+        def _handle_sigint(signum, frame):
+            nonlocal stop_requested
+            if stop_requested:
+                raise KeyboardInterrupt
+            stop_requested = True
+            if self.accelerator.is_local_main_process:
+                print("\n[SIGINT] Graceful stop requested. Press Ctrl+C again to force quit.", flush=True)
+
+        old_handler = signal.signal(signal.SIGINT, _handle_sigint)
+
+        try:
+            while self.max_steps <= 0 or global_update < self.max_steps:
+                if stop_requested:
+                    break
+                try:
+                    batch = next(train_iterator)
+                except StopIteration:
+                    train_iterator = iter(train_dataloader)
+                    continue
+
+                specs = batch["specs"]           # (B, T_pad, F)
+                lengths = batch["lengths"]        # (B,) actual frame counts
+                texts = batch["texts"]            # list[str]
+
+                B = specs.shape[0]
+                hop = self.gen.spec.hop_length
+
+                # ---- Split: first ref_ratio of each sample = voice reference ----
+                ref_len = (lengths.float() * self.ref_ratio).long().clamp(min=1)
+
+                # ---- Generate with frozen generator (voice reference + text) ----
+                with torch.no_grad(), self.accelerator.autocast():
+                    with open(os.devnull, 'w') as devnull, contextlib.redirect_stderr(devnull):
+                        generated, _trajectory = self.gen.sample(
+                            cond=specs,
+                            text=texts,
+                            duration=lengths,
+                            lens=ref_len,
+                            steps=self.gen_steps,
+                            cfg_strength=self.gen_cfg_strength,
+                        )
+
+                gen_max = generated.shape[1]
+
+                # ---- Per-sample: extract tails beyond reference, convert to waveform, truncate to min ----
+                real_wavs = []
+                fake_wavs = []
+                for i in range(B):
+                    r = ref_len[i].item()
+                    t = lengths[i].item()
+
+                    # Real tail: frames after the voice reference
+                    real_tail = specs[i, r:t]  # (real_tail_frames, F)
+                    # Fake tail: generated frames after the voice reference
+                    fake_tail = generated[i, r:min(t, gen_max)]
+
+                    min_f = min(real_tail.shape[0], fake_tail.shape[0])
+                    if min_f < 4:  # skip samples that are too short
+                        continue
+
+                    real_tail = real_tail[:min_f]
+                    fake_tail = fake_tail[:min_f]
+
+                    # Convert each sample to waveform individually (no MDCT-domain padding)
+                    r_wav = self.gen.spec.inverse(
+                        real_tail.unsqueeze(0).permute(0, 2, 1),
+                        length=min_f * hop,
+                    ).squeeze(0)  # (T_wav,)
+                    f_wav = self.gen.spec.inverse(
+                        fake_tail.unsqueeze(0).permute(0, 2, 1),
+                        length=min_f * hop,
+                    ).squeeze(0)
+
+                    # Truncate to the shorter waveform
+                    min_wav = min(r_wav.shape[-1], f_wav.shape[-1])
+                    real_wavs.append(r_wav[..., :min_wav])
+                    fake_wavs.append(f_wav[..., :min_wav])
+
+                if len(real_wavs) == 0:
+                    continue
+
+                # ---- Pad waveforms into a batch ----
+                real_wav = torch.nn.utils.rnn.pad_sequence(real_wavs, batch_first=True)
+                fake_wav = torch.nn.utils.rnn.pad_sequence(fake_wavs, batch_first=True)
+                real_wav = real_wav.unsqueeze(1)  # (B', 1, T_wav)
+                fake_wav = fake_wav.unsqueeze(1)
+
+                # ---- Discriminator forward ----
+                d_real_scores, fmap_real_nested = self.model(real_wav)
+                d_fake_scores, fmap_fake_nested = self.model(fake_wav)
+
+                d_real = d_real_scores[0]  # (B'*segments,)
+                d_fake = d_fake_scores[0]
+                fmap_real = fmap_real_nested[0]   # list[Tensor] per discriminator layer
+                fmap_fake = fmap_fake_nested[0]
+
+                # ---- Loss computation ----
+                # L2 adversarial loss (LS-GAN style)
+                loss_real = adv_loss_fn(d_real, torch.ones_like(d_real))
+                loss_fake = adv_loss_fn(d_fake, torch.zeros_like(d_fake))
+                adv_loss = loss_real + loss_fake
+
+                # Feature matching loss
+                fm_loss = fm_loss_fn(fmap_real, fmap_fake)
+
+                loss = self.adv_loss_weight * adv_loss + self.fm_loss_weight * fm_loss
+
+                # ---- Accuracy ----
+                with torch.no_grad():
+                    real_acc = (d_real > 0.5).float().mean()
+                    fake_acc = (d_fake < 0.5).float().mean()
+                    accuracy = (real_acc + fake_acc) / 2
+
+                # ---- Backward ----
+                self.accelerator.backward(loss)
+
+                grad_norm = 0.0
+                if self.accelerator.sync_gradients:
+                    grad_norm = self.accelerator.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.max_grad_norm if self.max_grad_norm > 0 else float("inf"),
+                    ).item()
+
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+
+                if self.accelerator.sync_gradients:
+                    global_update += 1
+
+                    if progress is not None:
+                        progress.update(1)
+                        progress.set_postfix(
+                            update=str(global_update),
+                            loss=f"{loss.item():.4f}",
+                            acc=f"{accuracy.item():.2%}",
+                        )
+
+                # ---- TensorBoard ----
+                if (
+                    self.accelerator.is_local_main_process
+                    and self.writer is not None
+                    and self.log_every_steps > 0
+                    and global_update % self.log_every_steps == 0
+                ):
+                    self.writer.add_scalar("disc/loss", loss.item(), global_update)
+                    self.writer.add_scalar("disc/adv_loss", adv_loss.item(), global_update)
+                    self.writer.add_scalar("disc/fm_loss", fm_loss.item(), global_update)
+                    self.writer.add_scalar("disc/accuracy", accuracy.item(), global_update)
+                    self.writer.add_scalar("disc/grad_norm", grad_norm, global_update)
+                    self.writer.add_scalar("disc/lr", self.scheduler.get_last_lr()[0], global_update)
+
+                # ---- Save model_last periodically ----
+                if (
+                    self.last_per_updates > 0
+                    and global_update % self.last_per_updates == 0
+                    and self.accelerator.sync_gradients
+                ):
+                    self.save_checkpoint(global_update, last=True)
+
+                # ---- Save full checkpoint periodically ----
+                if (
+                    self.save_per_updates > 0
+                    and global_update % self.save_per_updates == 0
+                    and self.accelerator.sync_gradients
+                ):
+                    self.save_checkpoint(global_update)
 
             if global_update > start_update:
                 self.save_checkpoint(global_update, last=True)

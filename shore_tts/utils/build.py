@@ -15,6 +15,7 @@ from accelerate import Accelerator
 from shore_tts.datasets.dataset import build_dataloader
 from shore_tts.models.diffusion.cfm import CFM
 from shore_tts.models.diffusion.dit import DiT
+from shore_tts.models.gan.fwd import FastWaveD
 from shore_tts.optimizer.muon import Muon_AdamW
 from shore_tts.text.tokenizer import PinyinTokenizer
 
@@ -82,6 +83,9 @@ def build_model(config: dict[str, Any]) -> CFM:
     model = CFM(transformer=transformer, **cfm_cfg)
     return model
 
+def build_discriminator(config: dict[str, Any]) -> FastWaveD:
+    fwd_cfg = dict(config["model"]["fwd"])
+    return FastWaveD(**fwd_cfg)
 
 def build_optimizer(config: dict[str, Any], model: torch.nn.Module):
     optim_cfg = config["optim"]

@@ -13,8 +13,8 @@ os.environ["PROJECT_ROOT"] = project_root
 import warnings
 warnings.filterwarnings("ignore")
 
-from shore_tts.utils.build import build_model, load_json_config, set_seed
-from shore_tts.utils.trainer import Trainer
+from shore_tts.utils.build import build_model, build_discriminator, load_json_config, set_seed
+from shore_tts.utils.trainer import Trainer, DiscriminatorTrainer
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +32,13 @@ def main() -> None:
     args = parse_args()
     config = load_json_config(args.config)
 
-    model = build_model(config)
-    trainer = Trainer(model, config)
+    if "fwd" in config.get("model", {}):
+        generator = build_model(config)
+        discriminator = build_discriminator(config)
+        trainer = DiscriminatorTrainer(generator, discriminator, config)
+    else:
+        model = build_model(config)
+        trainer = Trainer(model, config)
 
     set_seed(int(config.get("seed", 42)), trainer.accelerator.process_index)
     trainer.train()
