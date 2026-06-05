@@ -80,6 +80,16 @@ class CFM(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    def _to_spec(self, x: torch.Tensor, lens: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Convert raw waveform (B, T) to MDCT features (B, N, D) and adjust lens to frame lengths."""
+        x = self.spec(x)
+        x = x.permute(0, 2, 1)
+        assert x.shape[-1] == self.num_channels
+        if lens is not None:
+            hop = self.spec.hop_length
+            lens = (lens + hop - 1) // hop + 1
+        return x, lens
+
     def tokenize_text(self, text: list[str] | list[list[str]], device: torch.device) -> torch.Tensor:
         if self.vocab_char_map is None:
             raise ValueError("CFM requires a vocabulary-backed tokenizer; byte-level fallback has been removed.")
@@ -116,15 +126,8 @@ class CFM(nn.Module):
     ):
         self.eval()
         # Accept either raw waveform `(B, T)` or precomputed features `(B, N, D)`.
-
         if cond.ndim == 2:
-            cond = self.spec(cond)
-            cond = cond.permute(0, 2, 1)
-            assert cond.shape[-1] == self.num_channels
-            # lens was passed as sample lengths; convert to MDCT frame lengths
-            if lens is not None:
-                hop = self.spec.hop_length
-                lens = (lens + hop - 1) // hop + 1
+            cond, lens = self._to_spec(cond, lens)
 
         cond = cond.to(next(self.parameters()).dtype)
 
@@ -232,7 +235,7 @@ class CFM(nn.Module):
 
         if self.odeint_kwargs.get("method") == "euler":
             y = y0
-            trajectory = [y0] if t[0] == 0 else [y0]
+            trajectory = [y0]
             t_steps = t[1:] - t[:-1]
             for i in tqdm(range(len(t) - 1), desc="Sampling", unit="step"):
                 y = y + t_steps[i] * fn(t[i], y)
@@ -258,17 +261,10 @@ class CFM(nn.Module):
         text: int["b nt"] | list[str],
         *,
         lens: int["b"] | None = None,
-        noise_scheduler: str | None = None,
     ):
         # handle raw wave
         if inp.ndim == 2:
-            inp = self.spec(inp)
-            inp = inp.permute(0, 2, 1)
-            assert inp.shape[-1] == self.num_channels
-            # lens was passed as sample lengths; convert to MDCT frame lengths
-            if lens is not None:
-                hop = self.spec.hop_length
-                lens = (lens + hop - 1) // hop + 1
+            inp, lens = self._to_spec(inp, lens)
 
         batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
 
@@ -297,7 +293,6 @@ class CFM(nn.Module):
 
         # time step
         time = torch.rand((batch,), dtype=dtype, device=self.device)
-        # TODO. noise_scheduler
 
         # sample xt (φ_t(x) in the paper)
         t = time.unsqueeze(-1).unsqueeze(-1)

@@ -5,8 +5,8 @@
     "mdct_config": "shore_tts/configs/mdct.json",
     "num_workers": 16,
     "min_length": 120,
-    "max_length": 9600,
-    "batch_size": 32,
+    "max_length": 7200,
+    "batch_size": 96,
     "epoch_shuffle": true
   },
   "text": {
@@ -28,7 +28,7 @@
       "conv_layers": 6,
       "pe_attn_head": 1,
       "attn_backend": "flash_attn",
-      "attn_mask_enabled": true,
+      "attn_mask_enabled": false,
       "long_skip_connection": false,
       "checkpoint_activations": true
     },

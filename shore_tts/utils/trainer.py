@@ -10,6 +10,7 @@ from typing import Any
 import signal
 
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torchaudio
 from tqdm.auto import tqdm
@@ -23,9 +24,8 @@ from shore_tts.utils.build import (
     build_optimizer,
     build_scheduler,
     build_train_dataloader,
-    get_mdct_feature_config,
 )
-from shore_tts.utils.loss import L2Loss, FeatureMatchingLoss
+from shore_tts.utils.loss import FeatureMatchingLoss
 
 
 class Trainer:
@@ -303,10 +303,7 @@ class Trainer:
             ).cpu()
             ref_audio = ref_wav[:, :ref_wav_len].cpu()
 
-        sample_rate = int(
-            self.config["data"].get("sample_rate")
-            or get_mdct_feature_config(self.config["data"]["mdct_config"])["sample_rate"]
-        )
+        sample_rate = raw_model.spec.target_sample_rate
         ref_path = str(sample_dir / f"step_{global_update:08d}_ref.wav")
         gen_path = str(sample_dir / f"step_{global_update:08d}_gen.wav")
         torchaudio.save(ref_path, ref_audio, sample_rate)
@@ -673,7 +670,6 @@ class DiscriminatorTrainer(Trainer):
                 desc="disc_train",
             )
 
-        adv_loss_fn = L2Loss()
         fm_loss_fn = FeatureMatchingLoss()
 
         self.model.train()
@@ -701,18 +697,17 @@ class DiscriminatorTrainer(Trainer):
                     train_iterator = iter(train_dataloader)
                     continue
 
-                specs = batch["wavs"]             # (B, T_pad_wav) raw waveforms
+                wavs = batch["wavs"]             # (B, T_pad_wav) raw waveforms
                 wav_lengths = batch["wav_lengths"] # (B,) sample lengths
                 texts = batch["texts"]            # list[str]
 
-                hop = self.gen.spec.hop_length
-
                 # Compute MDCT features on GPU from raw waveforms
                 with torch.no_grad():
-                    specs_feat = self.gen.spec(specs).permute(0, 2, 1)  # (B, T_frames, F)
-                lengths = (wav_lengths + hop - 1) // hop + 1  # frame lengths
+                    specs_feat, lengths = self.gen._to_spec(wavs, wav_lengths)
 
-                B = specs.shape[0]
+                hop = self.gen.spec.hop_length
+
+                B = wavs.shape[0]
 
                 # ---- Split: first ref_ratio of each sample = voice reference ----
                 ref_len = (lengths.float() * self.ref_ratio).long().clamp(min=1)
@@ -785,8 +780,8 @@ class DiscriminatorTrainer(Trainer):
 
                 # ---- Loss computation ----
                 # L2 adversarial loss (LS-GAN style)
-                loss_real = adv_loss_fn(d_real, torch.ones_like(d_real))
-                loss_fake = adv_loss_fn(d_fake, torch.zeros_like(d_fake))
+                loss_real = F.mse_loss(d_real, torch.ones_like(d_real))
+                loss_fake = F.mse_loss(d_fake, torch.zeros_like(d_fake))
                 adv_loss = loss_real + loss_fake
 
                 # Feature matching loss

@@ -167,7 +167,6 @@ def build_train_dataloader(config: dict[str, Any], accelerator: Accelerator):
         config_path=data_cfg["mdct_config"],
         sample_rate=data_cfg.get("sample_rate"),
         hop_length=data_cfg.get("hop_length"),
-        n_bands=data_cfg.get("n_bands"),
         min_length=int(data_cfg.get("min_length", 10)),
         max_length=int(data_cfg.get("max_length", 1000)),
         batch_size=int(data_cfg.get("batch_size", 32)),

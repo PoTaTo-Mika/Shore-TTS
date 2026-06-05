@@ -28,7 +28,6 @@ class MDCTSpec(nn.Module):
         self.n_bands = n_bands
         self.target_sample_rate = target_sample_rate
         self.num_channels = self.n_bands + self.hop_length
-        self.mdct_channels = self.num_channels
         self.extractor = BN_MDCT_Spectrogram(hop_length=hop_length, n_bands=n_bands)
 
         self.register_buffer("dummy", torch.tensor(0), persistent=False)

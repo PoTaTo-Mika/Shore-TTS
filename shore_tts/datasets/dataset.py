@@ -18,8 +18,7 @@ _DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "mdct
 _AUDIO_KEYS = ("wav", "flac", "mp3", "m4a", "ogg", "opus")
 
 
-def _identity_splitter(src, group=None):
-    """Use the shard list as-is when partitioning is already handled upstream."""
+def _identity_splitter(src):
     yield from src
 
 
@@ -71,7 +70,6 @@ class ShoreDataset(IterableDataset):
         config_path: str = _DEFAULT_CONFIG,
         sample_rate: Optional[int] = None,
         hop_length: Optional[int] = None,
-        n_bands: Optional[int] = None,
         min_length: int = 10,
         max_length: int = 1000,
         batch_size: int = 32,
@@ -123,17 +121,20 @@ class ShoreDataset(IterableDataset):
         idx = bisect.bisect_right(self._bucket_boundaries, frame_length) - 1
         return max(0, min(idx, self.n_buckets - 1))
 
-    def _extract_duration(self, sample: dict) -> Optional[float]:
-        """Extract duration from json metadata without decoding audio."""
+    @staticmethod
+    def _parse_json(sample: dict) -> Optional[dict]:
         if "json" not in sample:
             return None
         raw = sample["json"]
         try:
-            meta = json.loads(raw) if isinstance(raw, (bytes, str)) else raw if isinstance(raw, dict) else None
-            if meta and "duration" in meta:
-                return float(meta["duration"])
+            return json.loads(raw) if isinstance(raw, (bytes, str)) else raw if isinstance(raw, dict) else None
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
-            pass
+            return None
+
+    def _extract_duration(self, sample: dict) -> Optional[float]:
+        meta = self._parse_json(sample)
+        if meta and "duration" in meta:
+            return float(meta["duration"])
         return None
 
     def _effective_batch_size(self, bucket: List[dict]) -> int:
@@ -185,22 +186,11 @@ class ShoreDataset(IterableDataset):
 
     @staticmethod
     def _extract_text(sample: dict) -> Optional[str]:
-        """兼容 .txt 与 .json（Emilia）标注，提取 text 字段。"""
         if "txt" in sample:
             raw = sample["txt"]
             return raw.decode("utf-8").strip() if isinstance(raw, bytes) else str(raw).strip()
-        if "json" in sample:
-            raw = sample["json"]
-            try:
-                meta = json.loads(raw) if isinstance(raw, (bytes, str)) else raw if isinstance(raw, dict) else None
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return None
-            return (meta.get("text") or "").strip() or None if meta else None
-        return None
-
-    def _estimate_frame_length(self, waveform: torch.Tensor) -> int:
-        """按 sample_rate / hop_length 估算 MDCT 帧数；24000 / 100 = 240 frame/s。"""
-        return waveform.shape[-1] // self.hop_length
+        meta = ShoreDataset._parse_json(sample)
+        return (meta.get("text") or "").strip() or None if meta else None
 
     def _decode_sample(self, sample: dict) -> Optional[dict]:
         """解析 + 解码 + 帧长预过滤，返回 {"wav": (T,), "text": str} 或 None。"""
@@ -220,7 +210,7 @@ class ShoreDataset(IterableDataset):
         if sr != self.sample_rate:
             waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
 
-        frame_length = self._estimate_frame_length(waveform)
+        frame_length = waveform.shape[-1] // self.hop_length
         if not (self.min_length <= frame_length <= self.max_length):
             return None
 
@@ -244,7 +234,6 @@ def build_dataloader(
     config_path: str = _DEFAULT_CONFIG,
     sample_rate: Optional[int] = None,
     hop_length: Optional[int] = None,
-    n_bands: Optional[int] = None,
     min_length: int = 10,
     max_length: int = 1000,
     batch_size: int = 32,
@@ -260,7 +249,6 @@ def build_dataloader(
         config_path=config_path,
         sample_rate=sample_rate,
         hop_length=hop_length,
-        n_bands=n_bands,
         max_tokens_per_batch=max_tokens_per_batch,
         min_length=min_length,
         max_length=max_length,

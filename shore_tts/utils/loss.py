@@ -32,16 +32,6 @@ class FrequencyWeightedMSELoss(nn.Module):
             loss = loss[mask]
         return loss.mean()
 
-class L2Loss(nn.Module):
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        loss = (pred - target).pow(2)
-
-        if mask is not None:
-            loss = loss[mask]
-        return loss.mean()
-
-
 class FeatureMatchingLoss(nn.Module):
     """Feature matching loss that minimizes L1 distance between real and fake
     intermediate discriminator feature maps.  `fmaps_real` and `fmaps_fake`
