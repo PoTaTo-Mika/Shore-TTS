@@ -1,5 +1,7 @@
+import bisect
 import io
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -10,8 +12,6 @@ import torchaudio
 from torch.utils.data import DataLoader, IterableDataset
 
 import webdataset as wds
-
-from shore_tts.utils.spectrogram import BN_MDCT_Spectrogram
 
 _DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "mdct.json")
 
@@ -52,17 +52,15 @@ def _assign_tar_files_by_size(tar_files: List[str], world_size: int) -> List[Lis
 
 
 def _collate_batch(samples: List[dict]) -> dict:
-    """零填充组批。返回 specs(B,T,F), lengths(B), mask(B,T), texts。"""
-    specs = [s["spec"] for s in samples]
+    """零填充组批。返回 wavs(B,T_wav), wav_lengths(B), texts。"""
+    wavs = [s["wav"] for s in samples]
     texts = [s["text"] for s in samples]
-    lengths = torch.tensor([s.shape[0] for s in specs], dtype=torch.long)
-    T_max = int(lengths.max())
-    F = specs[0].shape[1]
-    padded = torch.zeros(len(specs), T_max, F)
-    for i, sp in enumerate(specs):
-        padded[i, : sp.shape[0]] = sp
-    mask = torch.arange(T_max).unsqueeze(0) < lengths.unsqueeze(1)
-    return {"specs": padded, "lengths": lengths, "mask": mask, "texts": texts}
+    wav_lengths = torch.tensor([w.shape[0] for w in wavs], dtype=torch.long)
+    T_max = int(wav_lengths.max())
+    padded = torch.zeros(len(wavs), T_max)
+    for i, w in enumerate(wavs):
+        padded[i, : w.shape[0]] = w
+    return {"wavs": padded, "wav_lengths": wav_lengths, "texts": texts}
 
 
 class ShoreDataset(IterableDataset):
@@ -77,6 +75,8 @@ class ShoreDataset(IterableDataset):
         min_length: int = 10,
         max_length: int = 1000,
         batch_size: int = 32,
+        n_buckets: int = 20,
+        max_tokens_per_batch: Optional[int] = None,
         epoch_shuffle: bool = True,
         rank: int = 0,
         world_size: int = 1,
@@ -90,6 +90,8 @@ class ShoreDataset(IterableDataset):
         self.min_length = min_length
         self.max_length = max_length
         self.batch_size = batch_size
+        self.n_buckets = n_buckets
+        self.max_tokens_per_batch = max_tokens_per_batch
         self.epoch_shuffle = epoch_shuffle
         self.rank = rank
         self.world_size = world_size
@@ -97,11 +99,11 @@ class ShoreDataset(IterableDataset):
 
         self.tar_files = _discover_tar_files(data_path)
 
-        self.mdct = BN_MDCT_Spectrogram(
-            hop_length=self.hop_length,
-            n_bands=n_bands or mdct.get("n_bands", 20),
-        )
-        self.mdct.eval()
+        # Precompute log-spaced bucket boundaries
+        log_min = math.log10(max(self.min_length, 1))
+        log_max = math.log10(self.max_length)
+        step = (log_max - log_min) / self.n_buckets
+        self._bucket_boundaries = [10 ** (log_min + i * step) for i in range(self.n_buckets + 1)]
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
@@ -117,6 +119,30 @@ class ShoreDataset(IterableDataset):
         assignments = _assign_tar_files_by_size(tar_files, self.world_size)
         return assignments[(self.rank + cycle) % self.world_size]
 
+    def _find_bucket(self, frame_length: int) -> int:
+        idx = bisect.bisect_right(self._bucket_boundaries, frame_length) - 1
+        return max(0, min(idx, self.n_buckets - 1))
+
+    def _extract_duration(self, sample: dict) -> Optional[float]:
+        """Extract duration from json metadata without decoding audio."""
+        if "json" not in sample:
+            return None
+        raw = sample["json"]
+        try:
+            meta = json.loads(raw) if isinstance(raw, (bytes, str)) else raw if isinstance(raw, dict) else None
+            if meta and "duration" in meta:
+                return float(meta["duration"])
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _effective_batch_size(self, bucket: List[dict]) -> int:
+        """Dynamic batch size: cap by max_tokens_per_batch if set."""
+        if not self.max_tokens_per_batch or not bucket:
+            return self.batch_size
+        max_wav = max(s["wav"].shape[0] for s in bucket)
+        return max(1, self.max_tokens_per_batch // max_wav)
+
     def _iter_cycle_batches(self, tar_files: List[str]):
         if not tar_files:
             return
@@ -127,18 +153,35 @@ class ShoreDataset(IterableDataset):
             shardshuffle=len(tar_files) if self.epoch_shuffle else 0,
             nodesplitter=_identity_splitter,
         )
-        buf: List[dict] = []
+        buckets: List[List[dict]] = [[] for _ in range(self.n_buckets)]
+
         for raw in stream:
+            # Pre-filter using json duration (skip expensive audio decode)
+            duration = self._extract_duration(raw)
+            if duration is not None:
+                frame_len = int(duration * self.sample_rate / self.hop_length)
+                if not (self.min_length <= frame_len <= self.max_length):
+                    continue
+
             decoded = self._decode_sample(raw)
             if decoded is None:
                 continue
-            buf.append(decoded)
-            if len(buf) >= self.batch_size:
-                yield _collate_batch(buf)
-                buf = []
 
-        if buf:
-            yield _collate_batch(buf)
+            frame_len = decoded["wav"].shape[0] // self.hop_length
+            idx = self._find_bucket(frame_len)
+            buckets[idx].append(decoded)
+
+            eff_bs = self._effective_batch_size(buckets[idx])
+            while len(buckets[idx]) >= eff_bs:
+                yield _collate_batch(buckets[idx][:eff_bs])
+                buckets[idx] = buckets[idx][eff_bs:]
+                if buckets[idx]:
+                    eff_bs = self._effective_batch_size(buckets[idx])
+
+        # Flush remaining
+        for bucket in buckets:
+            if bucket:
+                yield _collate_batch(bucket)
 
     @staticmethod
     def _extract_text(sample: dict) -> Optional[str]:
@@ -160,7 +203,7 @@ class ShoreDataset(IterableDataset):
         return waveform.shape[-1] // self.hop_length
 
     def _decode_sample(self, sample: dict) -> Optional[dict]:
-        """解析 + 解码 + 帧长预过滤 + MDCT，返回 {"spec": (T,F), "text": str} 或 None。"""
+        """解析 + 解码 + 帧长预过滤，返回 {"wav": (T,), "text": str} 或 None。"""
         audio_bytes = next((sample[k] for k in _AUDIO_KEYS if k in sample), None)
         if audio_bytes is None:
             return None
@@ -181,9 +224,7 @@ class ShoreDataset(IterableDataset):
         if not (self.min_length <= frame_length <= self.max_length):
             return None
 
-        with torch.no_grad():
-            spec = self.mdct(waveform).squeeze(0)  # (T, F)
-        return {"spec": spec, "text": text}
+        return {"wav": waveform.squeeze(0), "text": text}
 
     def __iter__(self):
         cycle = self._epoch
@@ -207,6 +248,8 @@ def build_dataloader(
     min_length: int = 10,
     max_length: int = 1000,
     batch_size: int = 32,
+    n_buckets: int = 20,
+    max_tokens_per_batch: Optional[int] = None,
     num_workers: int = 4,
     epoch_shuffle: bool = True,
     rank: int = 0,
@@ -218,9 +261,11 @@ def build_dataloader(
         sample_rate=sample_rate,
         hop_length=hop_length,
         n_bands=n_bands,
+        max_tokens_per_batch=max_tokens_per_batch,
         min_length=min_length,
         max_length=max_length,
         batch_size=batch_size,
+        n_buckets=n_buckets,
         epoch_shuffle=epoch_shuffle,
         rank=rank,
         world_size=world_size,

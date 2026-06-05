@@ -1,12 +1,12 @@
 {
   "seed": 42,
   "data": {
-    "data_path": "/root/Audio-Data/",
+    "data_path": "/root/Audio-Data/Emilia",
     "mdct_config": "shore_tts/configs/mdct.json",
     "num_workers": 16,
-    "min_length": 480,
+    "min_length": 120,
     "max_length": 9600,
-    "batch_size": 64,
+    "batch_size": 32,
     "epoch_shuffle": true
   },
   "text": {
@@ -15,17 +15,17 @@
   },
   "model": {
     "dit": {
-      "dim": 768,
+      "dim": 1152,
       "depth": 22,
-      "heads": 12,
+      "heads": 18,
       "dim_head": 64,
       "dropout": 0.1,
-      "ff_mult": 2,
-      "text_dim": 512,
+      "ff_mult": 4,
+      "text_dim": 768,
       "text_mask_padding": true,
       "text_embedding_average_upsampling": false,
       "qk_norm": null,
-      "conv_layers": 4,
+      "conv_layers": 6,
       "pe_attn_head": 1,
       "attn_backend": "flash_attn",
       "attn_mask_enabled": true,
@@ -59,7 +59,7 @@
   "scheduler": {
     "warmup_steps": 20000,
     "warmup_start_factor": 1e-8,
-    "final_lr_scale": 1e-8
+    "final_lr_scale": 1e-7
   },
   "train": {
     "epochs": 1000,
@@ -80,11 +80,11 @@
       "cfg_strength": 1.0,
       "duration_factor": 2.0
     },
-    "save_dir": "checkpoints/pretrain-200M",
-    "resume_from": "checkpoints/pretrain-200M/model_last.pt",
+    "save_dir": "checkpoints/pretrain-500M",
+    "resume_from": "checkpoints/pretrain-500M/model_last.pt",
     "tensorboard": {
       "enabled": true,
-      "log_dir": "checkpoints/pretrain-200M/tensorboard"
+      "log_dir": "checkpoints/pretrain-500M/tensorboard"
     }
   }
 }

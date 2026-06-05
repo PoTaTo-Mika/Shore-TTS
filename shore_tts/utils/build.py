@@ -160,6 +160,8 @@ def build_scheduler(config: dict[str, Any], optimizer, num_processes: int = 1):
 
 def build_train_dataloader(config: dict[str, Any], accelerator: Accelerator):
     data_cfg = config["data"]
+    n_buckets = data_cfg.get("n_buckets")
+    max_tokens = data_cfg.get("max_tokens_per_batch")
     return build_dataloader(
         data_path=data_cfg["data_path"],
         config_path=data_cfg["mdct_config"],
@@ -169,6 +171,8 @@ def build_train_dataloader(config: dict[str, Any], accelerator: Accelerator):
         min_length=int(data_cfg.get("min_length", 10)),
         max_length=int(data_cfg.get("max_length", 1000)),
         batch_size=int(data_cfg.get("batch_size", 32)),
+        n_buckets=int(n_buckets) if n_buckets is not None else 20,
+        max_tokens_per_batch=int(max_tokens) if max_tokens is not None else None,
         num_workers=int(data_cfg.get("num_workers", 4)),
         epoch_shuffle=bool(data_cfg.get("epoch_shuffle", True)),
         rank=accelerator.process_index,

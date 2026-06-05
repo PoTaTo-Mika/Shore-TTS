@@ -254,7 +254,9 @@ class Trainer:
             return []
 
         max_sample_frames = int(sample_cfg.get("max_sample_frames", 4800))
-        eligible = (batch["lengths"] < max_sample_frames).nonzero(as_tuple=False).flatten()
+        raw_model = self.accelerator.unwrap_model(self.model)
+        frame_lens = batch["wav_lengths"] // raw_model.spec.hop_length
+        eligible = (frame_lens < max_sample_frames).nonzero(as_tuple=False).flatten()
         if eligible.numel() == 0:
             print(
                 f"[samples] update={global_update} skipped: "
@@ -265,7 +267,6 @@ class Trainer:
         sample_index = int(sample_cfg.get("sample_index", 0))
         sample_index = int(eligible[sample_index % eligible.numel()].item())
 
-        raw_model = self.accelerator.unwrap_model(self.model)
         original_state = None
         if self.ema_model is not None:
             original_state = {k: v.detach().clone() for k, v in raw_model.state_dict().items()}
@@ -278,29 +279,29 @@ class Trainer:
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         device = self.accelerator.device
-        ref_spec = batch["specs"][sample_index : sample_index + 1]
-        ref_len = int(batch["lengths"][sample_index].item())
+        ref_wav = batch["wavs"][sample_index : sample_index + 1]
+        ref_wav_len = int(batch["wav_lengths"][sample_index].item())
         ref_text = batch["texts"][sample_index]
+        hop = raw_model.spec.hop_length
+        ref_len = (ref_wav_len + hop - 1) // hop + 1
         duration = int(max(ref_len * float(sample_cfg.get("duration_factor", 2.0)), ref_len + 1))
         sample_steps = int(sample_cfg.get("sample_steps", 16))
         cfg_strength = float(sample_cfg.get("cfg_strength", 1.0))
 
         with torch.inference_mode(), self.accelerator.autocast():
             generated, _ = raw_model.sample(
-                cond=ref_spec[:, :ref_len],
+                cond=ref_wav[:, :ref_wav_len],
                 text=[f"{ref_text} {ref_text}"],
                 duration=duration,
                 steps=sample_steps,
                 cfg_strength=cfg_strength,
-                lens=torch.tensor([ref_len], device=device, dtype=torch.long),
+                lens=torch.tensor([ref_wav_len], device=device, dtype=torch.long),
             )
             generated = generated[:, ref_len:, :]
             gen_audio = raw_model.spec.inverse(
-                generated.permute(0, 2, 1), length=generated.shape[1] * raw_model.spec.hop_length
+                generated.permute(0, 2, 1), length=generated.shape[1] * hop
             ).cpu()
-            ref_audio = raw_model.spec.inverse(
-                ref_spec[:, :ref_len].permute(0, 2, 1), length=ref_len * raw_model.spec.hop_length
-            ).cpu()
+            ref_audio = ref_wav[:, :ref_wav_len].cpu()
 
         sample_rate = int(
             self.config["data"].get("sample_rate")
@@ -378,9 +379,9 @@ class Trainer:
 
                 with self.accelerator.accumulate(self.model):
                     loss, _, _, loss_low, loss_high = self.model(
-                        inp=batch["specs"],
+                        inp=batch["wavs"],
                         text=batch["texts"],
-                        lens=batch["lengths"],
+                        lens=batch["wav_lengths"],
                     )
                     self.accelerator.backward(loss)
 
@@ -700,12 +701,18 @@ class DiscriminatorTrainer(Trainer):
                     train_iterator = iter(train_dataloader)
                     continue
 
-                specs = batch["specs"]           # (B, T_pad, F)
-                lengths = batch["lengths"]        # (B,) actual frame counts
+                specs = batch["wavs"]             # (B, T_pad_wav) raw waveforms
+                wav_lengths = batch["wav_lengths"] # (B,) sample lengths
                 texts = batch["texts"]            # list[str]
 
-                B = specs.shape[0]
                 hop = self.gen.spec.hop_length
+
+                # Compute MDCT features on GPU from raw waveforms
+                with torch.no_grad():
+                    specs_feat = self.gen.spec(specs).permute(0, 2, 1)  # (B, T_frames, F)
+                lengths = (wav_lengths + hop - 1) // hop + 1  # frame lengths
+
+                B = specs.shape[0]
 
                 # ---- Split: first ref_ratio of each sample = voice reference ----
                 ref_len = (lengths.float() * self.ref_ratio).long().clamp(min=1)
@@ -714,7 +721,7 @@ class DiscriminatorTrainer(Trainer):
                 with torch.no_grad(), self.accelerator.autocast():
                     with open(os.devnull, 'w') as devnull, contextlib.redirect_stderr(devnull):
                         generated, _trajectory = self.gen.sample(
-                            cond=specs,
+                            cond=specs_feat,
                             text=texts,
                             duration=lengths,
                             lens=ref_len,
@@ -732,7 +739,7 @@ class DiscriminatorTrainer(Trainer):
                     t = lengths[i].item()
 
                     # Real tail: frames after the voice reference
-                    real_tail = specs[i, r:t]  # (real_tail_frames, F)
+                    real_tail = specs_feat[i, r:t]  # (real_tail_frames, F)
                     # Fake tail: generated frames after the voice reference
                     fake_tail = generated[i, r:min(t, gen_max)]
 

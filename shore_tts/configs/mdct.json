@@ -1,6 +1,6 @@
 {
     "mdct_params": {
-        "hop_length": 100,
+        "hop_length": 200,
         "n_bands": 20
     },
     "audio_extensions": [".mp3", ".wav", ".m4a", ".ogg", ".opus"],

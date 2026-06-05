@@ -121,6 +121,10 @@ class CFM(nn.Module):
             cond = self.spec(cond)
             cond = cond.permute(0, 2, 1)
             assert cond.shape[-1] == self.num_channels
+            # lens was passed as sample lengths; convert to MDCT frame lengths
+            if lens is not None:
+                hop = self.spec.hop_length
+                lens = (lens + hop - 1) // hop + 1
 
         cond = cond.to(next(self.parameters()).dtype)
 
@@ -261,6 +265,10 @@ class CFM(nn.Module):
             inp = self.spec(inp)
             inp = inp.permute(0, 2, 1)
             assert inp.shape[-1] == self.num_channels
+            # lens was passed as sample lengths; convert to MDCT frame lengths
+            if lens is not None:
+                hop = self.spec.hop_length
+                lens = (lens + hop - 1) // hop + 1
 
         batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
 
